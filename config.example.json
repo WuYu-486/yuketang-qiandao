@@ -1,0 +1,8 @@
+{
+  "yuketang": {
+    "name": "me",
+    "wx": false,
+    "debug": true,
+    "open_qrcode": true
+  }
+}

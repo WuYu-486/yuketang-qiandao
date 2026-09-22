@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+
+# 本地登录态与运行产物（含隐私，不要提交）
+config.json
+cookie_*
+qrcode_*.jpg
+ACCESS_TOKEN.txt
+accounts.json
+history_*.log
+log_*.log
+gui_error.log
