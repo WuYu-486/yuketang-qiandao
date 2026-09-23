@@ -292,19 +292,33 @@ def cmd_ykt(cfg, name=None):
     ykt.msgmgr.debug = bool(cfg_ykt["debug"])
     ykt.msgmgr.wx = wx
 
-    print("[雨课堂] 等待有课进行中（每 30 秒查一次）...")
-    count = 0
-    while not ykt.getlesson():
-        time.sleep(30)
-        count += 1
-        if count > 200:
-            print("[雨课堂] 等待超时（约 100 分钟），退出")
-            return 1
-    print(f"[雨课堂] 检测到课程 lessonId={ykt.lessonId}，开始签到")
-    ykt.lesson_checkin()
-    ykt.ws_controller(ykt.ws_lesson)
-    print("[雨课堂] 监听结束")
-    return 0
+    print("[雨课堂] 等待有课进行中（每 30 秒查一次，不会自动退出）...")
+    waited = 0
+    # 常驻监听：去掉原来 count>200（约 100 分钟）的等课超时，
+    # 外层再套一层循环，一节课结束后回去等下一节课，直到手动关闭。
+    while True:
+        try:
+            while not ykt.getlesson():
+                time.sleep(30)
+                waited += 30
+                if waited % 600 == 0:      # 每 10 分钟报一次，免得看起来像卡死
+                    print(f"[雨课堂] 仍在等课（已等 {waited // 60} 分钟），"
+                          f"不手动关闭就一直等")
+            print(f"[雨课堂] 检测到课程 lessonId={ykt.lessonId}，开始签到")
+            waited = 0
+            ykt.lesson_checkin()
+            ykt.ws_controller(ykt.ws_lesson)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            # getlesson()/lesson_checkin() 上游都没设超时也没容错，网络抖一下
+            # 原来会直接结束进程；改成常驻后这里兜住，睡 30 秒继续等课
+            traceback.print_exc()
+            print("[雨课堂] 本轮出错，30 秒后重试（不会退出）")
+            time.sleep(30)
+            continue
+        print("[雨课堂] 本节监听结束，继续等下一节课 ..."
+              "（Ctrl+C 或界面“停止”才会退出）")
 
 
 # ---------------------------------------------------------------- 菜单
@@ -350,17 +364,18 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config()
-    if args.action == "check":
-        return cmd_check(cfg)
-    if args.action == "ykt":
-        return cmd_ykt(cfg, name=args.name)
-    if args.action == "login":
-        return cmd_login(cfg, name=args.name)
-    if args.action == "status":
-        return cmd_status(cfg, name=args.name)
     try:
+        if args.action == "check":
+            return cmd_check(cfg)
+        if args.action == "ykt":
+            return cmd_ykt(cfg, name=args.name)
+        if args.action == "login":
+            return cmd_login(cfg, name=args.name)
+        if args.action == "status":
+            return cmd_status(cfg, name=args.name)
         return menu(cfg)
     except (KeyboardInterrupt, EOFError):
+        # 常驻监听之后，Ctrl+C 就是正常的手动关闭方式，别甩一堆 traceback
         print("\n已退出")
         return 0
 

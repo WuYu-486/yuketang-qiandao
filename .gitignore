@@ -6,6 +6,7 @@ __pycache__/
 config.json
 cookie_*
 qrcode_*.jpg
+.qrcode_*.tmp
 ACCESS_TOKEN.txt
 accounts.json
 history_*.log

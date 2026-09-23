@@ -12,6 +12,10 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qywxbot.send import *
 
+# 异常重试间隔（秒）。上游靠 start_time<6000 兜底退出，改成常驻监听后
+# 必须自己限速，否则登录态失效或断网时会变成不间隔的死循环猛刷服务端。
+RETRY_INTERVAL = 5
+
 
 class yuketang:
     def __init__(self,name) -> None:
@@ -165,14 +169,18 @@ class yuketang:
     def ws_controller(self,func,loop=None):
         if loop is None:
             loop=asyncio.get_event_loop()
-        while True and time.time()-self.start_time<6000:
+        # 去掉 start_time<6000 的 100 分钟总时长上限：一直重试，直到正常结束
+        # （func 正常返回，比如课程结束）或进程被手动关闭。
+        while True:
             try:
                 loop.run_until_complete(func())
                 break
-            except:
+            except Exception:
+                # 这里必须是 Exception，不能用裸 except：裸 except 会把
+                # KeyboardInterrupt 一起吞掉，Ctrl+C 就停不下来了。
                 print(traceback.format_exc())
-                print("出现异常，重试中")
-                pass
+                print(f"出现异常，{RETRY_INTERVAL} 秒后重试（不手动关闭会一直重试）")
+                time.sleep(RETRY_INTERVAL)
 
 
     async def ws_login(self):
@@ -215,7 +223,8 @@ class yuketang:
             flag=1
             await websocket.send(json.dumps(hello_message))
 
-            while True and time.time()-self.start_time<6000:
+            # 同样去掉 100 分钟上限：本节内一直听，直到 lessonfinished 或连接断开
+            while True:
                 server_response = await recv_json(websocket)
                 op=server_response['op']
                 if op=="showpresentation" or op=="presentationupdated" or op=="presentationcreated":

@@ -40,7 +40,6 @@ FONT_SM = ("Microsoft YaHei UI", 9)
 FONT_B = ("Microsoft YaHei UI", 10, "bold")
 MONO = ("Consolas", 9)
 
-WATCH_MINUTES = 100      # 上游是 start_time < 6000 秒，也就是 100 分钟
 QR_TTL = 115             # 服务端二维码 120 秒失效，这里留几秒余量
 QR_SIZE = 260
 MAX_KEEP_LINES = 800
@@ -50,6 +49,27 @@ try:
     HAS_PIL = True
 except Exception:
     HAS_PIL = False
+
+
+def qr_file_ok(path):
+    """二维码文件是否真的能扫：存在、够大、且确实是张完整的图。
+
+    上游 download_qrcode 在 ticket 失效时会写出 0 字节文件并照常返回，
+    只判断 os.path.exists 会把它当成可用二维码，点开自然是一张打不开的图。
+    """
+    try:
+        if os.path.getsize(path) < 1024:    # 正常二维码约 39KB，几百字节的必是坏图
+            return False
+    except OSError:
+        return False
+    if not HAS_PIL:
+        return True                          # 没有 PIL 只能退化成按大小判断
+    try:
+        with Image.open(path) as im:
+            im.verify()                      # 校验完整性，不解码像素
+        return True
+    except Exception:
+        return False
 
 
 HISTORY_RULES = (
@@ -108,7 +128,7 @@ class Account:
         self.qr_mtime = None
         self.qr_accept_after = float("inf")   # 只认这之后生成的二维码，忽略历史遗留文件
         self.qr_photo = None
-        self.qr_state = "empty"   # empty / waiting / fresh / used
+        self.qr_state = "empty"   # empty / waiting / fresh / broken / used
         self.start_at = None
         self.login_ok = None
         self.login_name = None
@@ -587,7 +607,7 @@ class App:
                 foreground="#b26a00")
         elif running:
             self.lbl_watch.configure(
-                text=f"监听：运行中（约剩 {max(WATCH_MINUTES - used, 0)} 分钟）",
+                text=f"监听：运行中（已运行 {used} 分钟，不会自动停止）",
                 foreground="#1a7f37")
         else:
             self.lbl_watch.configure(text="监听：未运行", foreground="#666666")
@@ -626,8 +646,15 @@ class App:
             return
 
         acc.qr_mtime = mtime
-        acc.qr_state = "fresh"
         acc.qr_photo = None
+        if not qr_file_ok(path):
+            # 空文件/坏图：别冒充成能扫的二维码，等上层自动重试出新的一张
+            acc.qr_state = "broken"
+            if name == self._selected_name():
+                self._refresh_qr_panel(acc)
+            return
+
+        acc.qr_state = "fresh"
         if name != self._selected_name():
             return
         if HAS_PIL:
@@ -649,6 +676,13 @@ class App:
             who = f"（{acc.login_name}）" if acc.login_name else ""
             self.qr_label.configure(image="", text="登录完成\n无需扫码")
             self.lbl_qr_hint.configure(text=f"已登录{who}", foreground="#1a7f37")
+            return
+
+        if acc.qr_state == "broken":
+            self.qr_label.configure(image="", text="二维码没下载成功\n正在自动重试 ...")
+            self.lbl_qr_hint.configure(
+                text="刚拿到的 ticket 无效（服务端返回空响应），会自动换一张",
+                foreground="#b26a00")
             return
 
         age = None if acc.qr_mtime is None else time.time() - acc.qr_mtime
@@ -685,15 +719,23 @@ class App:
             return
         acc = self.accounts.get(name)
         path = os.path.join(ROOT, f"qrcode_{name}.jpg")
-        usable = (acc is not None and acc.qr_mtime is not None
+        usable = (acc is not None and acc.qr_state == "fresh"
+                  and acc.qr_mtime is not None
                   and acc.qr_mtime >= acc.qr_accept_after
-                  and acc.qr_state != "used" and os.path.exists(path))
+                  and qr_file_ok(path))
         if usable and hasattr(os, "startfile"):
             try:
                 os.startfile(path)
                 return
             except Exception:
                 pass
+        if acc is not None and acc.qr_state == "broken":
+            messagebox.showinfo(
+                "提示",
+                "这张二维码没下载成功（服务端返回了空响应），程序正在自动重试。\n"
+                "等几秒再点，或者点“刷新登录二维码”重新获取。",
+                parent=self.root)
+            return
         messagebox.showinfo("提示", "现在没有可用的二维码，先点“刷新登录二维码”",
                             parent=self.root)
 
