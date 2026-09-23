@@ -17,6 +17,36 @@ from qywxbot.send import *
 RETRY_INTERVAL = 5
 
 
+def api_ok(res):
+    """雨课堂接口是否成功：HTTP 2xx 且响应体 code == 0。
+
+    code==0 是这套接口的约定，见 check_cookie() 里对 basic-info 的判定
+    （成功返回 {"code":0,"msg":"OK","data":...}）。
+    """
+    if res.status_code >= 400:
+        return False
+    try:
+        body = res.json()
+    except Exception:
+        return True             # 2xx 但响应不是 JSON，就以 HTTP 状态为准
+    if isinstance(body, dict) and body.get("code") is not None:
+        return body.get("code") == 0
+    return True
+
+
+def api_reason(res):
+    """失败时给一句人能看懂的说明，用于历史记录"""
+    try:
+        body = res.json()
+        if isinstance(body, dict):
+            for key in ("msg", "message", "errcode", "error"):
+                if body.get(key):
+                    return f"{body[key]}"
+    except Exception:
+        pass
+    return f"HTTP {res.status_code}"
+
+
 class yuketang:
     def __init__(self,name) -> None:
         self.name=name
@@ -119,8 +149,20 @@ class yuketang:
         }
         res=requests.post(url=url,headers=headers,json=data)
         self.setAuthorization(res)
-        self.Auth=res.json()['data']['lessonToken']
-        self.userid=res.json()['data']['identityId']
+        # 原来这里直接取 res.json()['data']['lessonToken']，失败就抛 KeyError，
+        # 而界面上只留下"已发起签到"一句，看不出到底签到成没成。现在明确报一句。
+        if not api_ok(res):
+            reason=api_reason(res)
+            self.msgmgr.sendMsg(f"签到失败：{reason}",user=self.name)
+            raise RuntimeError(f"签到失败：{reason}")
+        try:
+            info=res.json()['data']
+            self.Auth=info['lessonToken']
+            self.userid=info['identityId']
+        except Exception:
+            self.msgmgr.sendMsg("签到失败：响应里没有 lessonToken/identityId",user=self.name)
+            raise
+        self.msgmgr.sendMsg("签到成功：已进入课堂",user=self.name)
 
     
     def fetch_presentation(self):
@@ -145,6 +187,12 @@ class yuketang:
         
 
     def answer(self):
+        # 用 get 而不是 []：本地没有这道题（比如 slide id 和 problem id 对不上）时，
+        # 原来会抛 KeyError 把整个监听打断，现在记一笔明确的失败。
+        problem=self.problems.get(self.problemid)
+        if problem is None:
+            self.msgmgr.sendMsg(f"答题失败：本地没有题目 {self.problemid} 的答案数据",user=self.name)
+            return
         url="https://www.yuketang.cn/api/v3/lesson/problem/answer"
         headers={
             "referer":f"https://www.yuketang.cn/lesson/fullscreen/v3/{self.lessonId}?source=5",
@@ -156,12 +204,18 @@ class yuketang:
         data={
             "dt":int(time.time()*1000),
             "problemId":self.problemid,
-            "problemType":self.problems[self.problemid]['problemType'],
-            "result":self.problems[self.problemid]['answers']
+            "problemType":problem['problemType'],
+            "result":problem['answers']
         }
         res=requests.post(url=url,headers=headers,json=data)
         self.setAuthorization(res)
-        self.msgmgr.sendMsg(json.dumps(data),self.name)
+        # 原来只把请求体 json 丢进历史，界面显示成"已提交作答：题型=.. 答案=.."，
+        # 看不出提交成功还是失败。改成成败都报，并保留题型/答案细节。
+        detail=f"题型={data['problemType']} 答案={data['result']}"
+        if api_ok(res):
+            self.msgmgr.sendMsg(f"答题成功：{detail}",user=self.name)
+        else:
+            self.msgmgr.sendMsg(f"答题失败：{api_reason(res)}（{detail}）",user=self.name)
 
 
 

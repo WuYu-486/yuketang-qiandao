@@ -822,19 +822,17 @@ class App:
         return os.path.join(ROOT, f"history_{name}.log")
 
     def _maybe_record(self, name, line):
+        # 签到/作答结果单独处理：要把"题型/答案/失败原因"这些每次都不同的细节
+        # 带进历史，不能像 HISTORY_RULES 那样只记一条固定文案。
+        for marker in ("签到成功", "签到失败", "答题成功", "答题失败"):
+            if marker in line:
+                detail = line.split(marker, 1)[1].lstrip("：: ").strip()
+                self._record(name, f"{marker}：{detail}" if detail else marker)
+                return
         for keyword, summary in HISTORY_RULES:
             if keyword in line:
                 self._record(name, summary)
                 break
-        if '"problemId"' in line:
-            detail = line[line.find("{"):] if "{" in line else line
-            try:
-                data = json.loads(detail)
-                summary = (f"已提交作答：题型={data.get('problemType')} "
-                           f"答案={data.get('result')}")
-            except Exception:
-                summary = f"已提交作答：{detail[:200]}"
-            self._record(name, summary)
 
     def _record(self, name, text):
         entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {name}  {text}"
