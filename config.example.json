@@ -12,7 +12,8 @@
       "api_key_env": "",
       "base_url": "",
       "model": "",
-      "timeout": 30
+      "send_images": true,
+      "timeout": 60
     }
   }
 }

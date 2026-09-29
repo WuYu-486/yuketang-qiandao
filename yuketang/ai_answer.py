@@ -30,6 +30,7 @@ PROBLEM_TYPE_NAMES = {
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _JSON_RE = re.compile(r"\{.*\}", re.S)
+_IMG_RE = re.compile(r"<img[^>]*src\s*=\s*[\"']?([^\"'\s>]+)", re.I)
 
 
 def plain_text(value):
@@ -74,8 +75,44 @@ def blank_count(problem):
     return 1
 
 
-def build_messages(problem):
-    """拼出给大模型的提示词"""
+def extract_image_urls(problem):
+    """找出题干 / 选项里引用的图片地址，按出现顺序去重"""
+    texts = [problem.get("body")]
+    for option in problem.get("options") or []:
+        if isinstance(option, dict):
+            texts.append(option.get("value") or option.get("text") or option.get("content"))
+        else:
+            texts.append(option)
+
+    urls = []
+    for text in texts:
+        if not text:
+            continue
+        for match in _IMG_RE.finditer(str(text)):
+            url = match.group(1).strip()
+            if url:
+                urls.append(url)
+
+    # 有的版本把图片单独放在这些字段里
+    for field in ("pics", "images", "image", "pic"):
+        value = problem.get(field)
+        for item in (value if isinstance(value, list) else [value]):
+            if isinstance(item, dict):
+                item = (item.get("url") or item.get("src")
+                        or item.get("pic") or item.get("value"))
+            if isinstance(item, str) and item.strip():
+                urls.append(item.strip())
+
+    seen, result = set(), []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def build_messages(problem, images=None):
+    """拼出给大模型的提示词；images 是已经准备好的图片 data URL 列表"""
     problem_type = int(problem.get("problemType") or 0)
     type_name = PROBLEM_TYPE_NAMES.get(problem_type, "其它题型")
 
@@ -100,8 +137,18 @@ def build_messages(problem):
 
     system = ("你是一个正在上课的学生，需要作答雨课堂课内题。"
               "只输出 JSON，不要解释，不要用 Markdown 代码块。")
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": "\n".join(lines)}]
+    text = "\n".join(lines)
+
+    if images:
+        # 有图片时用多模态格式：一段文字 + 若干图片
+        system += ("题干或选项里的图片已经一并给你，请结合图片内容作答；"
+                   "如果选项只出现在图片里，按图片中的选项标识作答。")
+        content = [{"type": "text", "text": text}]
+        content += [{"type": "image_url", "image_url": {"url": image}} for image in images]
+        user_message = {"role": "user", "content": content}
+    else:
+        user_message = {"role": "user", "content": text}
+    return [{"role": "system", "content": system}, user_message]
 
 
 def parse_json_object(text):
@@ -126,9 +173,11 @@ def parse_json_object(text):
         return None
 
 
-def solve_problem(problem, api_key, base_url, model, timeout=30):
+def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
     """调用大模型生成答案。
 
+    images 是图片的 data URL 列表（可为空）：带了图片就是多模态请求，
+    如果模型不接受图片，会自动退回纯文字再问一次。
     返回 (answers, note)：
       answers 为 None 表示这次没做出答案，note 是给日志用的原因 / 说明。
     """
@@ -138,26 +187,41 @@ def solve_problem(problem, api_key, base_url, model, timeout=30):
         return None, "没有配置 AI 作答的模型名"
 
     url = (base_url or "https://api.deepseek.com/v1").rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": build_messages(problem),
-        "temperature": 0.2,
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
+    def post(with_images):
+        payload = {
+            "model": model,
+            "messages": build_messages(problem, with_images),
+            "temperature": 0.2,
+        }
+        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+    note_suffix = ""
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        res = post(images if images else None)
     except Exception as e:
         return None, f"请求大模型失败：{type(e).__name__}: {e}"
+
+    if res.status_code >= 400 and images:
+        # 模型 / 接口不接受图片时退回纯文字，至少别把这道题整个丢掉
+        note_suffix = "，图片没被接受已按纯文字作答"
+        try:
+            res = post(None)
+        except Exception as e:
+            return None, f"请求大模型失败：{type(e).__name__}: {e}"
 
     if res.status_code >= 400:
         return None, f"大模型返回 HTTP {res.status_code}：{res.text[:160]}"
     try:
-        content = res.json()["choices"][0]["message"]["content"]
+        message = res.json()["choices"][0]["message"]
     except Exception:
         return None, "大模型的响应格式看不懂"
+    # 推理型模型偶尔把内容放在 reasoning_content 里
+    content = message.get("content") or message.get("reasoning_content") or ""
 
     data = parse_json_object(content)
     if not isinstance(data, dict):
@@ -169,4 +233,4 @@ def solve_problem(problem, api_key, base_url, model, timeout=30):
         return None, "大模型返回的 JSON 里没有 answers 字段"
     if not isinstance(answers, list):
         answers = [answers]
-    return answers, f"AI 作答（{model}）"
+    return answers, f"AI 作答（{model}{note_suffix}）"

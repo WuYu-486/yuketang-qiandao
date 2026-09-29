@@ -174,8 +174,9 @@ run.bat                # 打开交互菜单
 | `answer.api_key` | 大模型 API Key；留空时按下面顺序找：`api_key_env` 指定的环境变量 → `DEEPSEEK_API_KEY` / `DEEPSEEK-API-KEY` / `DASHSCOPE_API_KEY` 等常见环境变量 → 根目录 `dashscope_key.txt` |
 | `answer.api_key_env` | 想指定用哪个环境变量时填这里（例如 `DEEPSEEK-API-KEY`），留空就按上面的顺序自动找 |
 | `answer.base_url` | 大模型接口地址；留空时按 Key 的来源自动选（DeepSeek 用 `https://api.deepseek.com/v1`，百炼用 `https://dashscope.aliyuncs.com/compatible-mode/v1`） |
-| `answer.model` | 大模型名称；留空时按 Key 的来源自动选（`deepseek-chat` / `qwen3.8-max`） |
-| `answer.timeout` | 单次调用大模型的超时秒数，默认 30 |
+| `answer.model` | 大模型名称；留空时按 Key 的来源自动选（`deepseek-chat` / `qwen3.8-max`），也可以手写别的，例如 `deepseek-flash`、`deepseek-v4-pro` |
+| `answer.send_images` | 题目带图片时，是否把图片一起发给多模态模型，默认 `true` |
+| `answer.timeout` | 单次调用大模型的超时秒数，默认 60 |
 
 ### 签到方式是怎么决定的
 
@@ -204,6 +205,19 @@ run.bat                # 打开交互菜单
 1. 先找雨课堂下发的答案，真的有内容才提交；
 2. 没有答案时，按 `answer.source` 决定是否交给大模型生成答案；
 3. 两条路都拿不到答案，就直接记成「跳过作答」，并把题目原始数据写到 `debug_problem_课程_题目.json`，不会再拿空答案去交白卷。
+
+### 题目里有图片怎么办
+
+雨课堂的题干和选项都是 HTML，里面可能直接嵌着图片（`<img src=...>`），光靠文字模型是答不出来的；有些题甚至只有一张图，选项也在图上。
+
+现在遇到这种题会这样处理：
+
+1. 从题干和选项里把图片地址抠出来，用当前账号的 cookie 下载下来；
+2. 顺便把这道题所在课件的整页图（`cover`，也就是同学在 PPT 上看到的那一页）一起带上，图片题、表格题、公式题都能看清；
+3. 以「一段文字 + 最多 3 张图片」的多模态形式发给大模型（实测 `deepseek-flash` 支持图片输入）；
+4. 如果当前模型不吃图片（返回 4xx），会自动退回纯文字再问一次，日志里会标注「图片没被接受已按纯文字作答」，不会因为图片把整道题丢掉。
+
+不想发图片就把 `answer.send_images` 设成 `false`，程序只发文字。图片下载失败、超过 4 MB、或模型不支持都会在日志里留一行说明。
 
 想启用 AI 作答，只要让程序能找到大模型 API Key 就行，三种写法任选：填 `config.json` 的 `answer.api_key`、把 Key 放进同名环境变量、或写进根目录的 `dashscope_key.txt`。Key 在环境变量里时（例如机器上已经有 `DEEPSEEK-API-KEY`），接口地址和模型会自动按来源选好，不用手填。所有服务走 OpenAI 兼容的 `/chat/completions` 接口，想换成别家把 `answer.base_url` 和 `answer.model` 填上即可。找不到 Key 时程序只使用雨课堂下发的答案，功能一切照旧。
 
@@ -313,6 +327,7 @@ CompanyId = '你的企业ID'
 - 新增命令行入口 `run.py` / `run.bat`、配置模板、依赖清单与 `.gitignore`。
 - 修复图形界面的中文乱码：子进程原来按系统 GBK 输出、界面按 UTF-8 解码，导致日志和「历史记录」里的关键字全部匹配不上；现在统一按 UTF-8 输出。
 - 答题不再提交空答案：雨课堂不再下发课内题答案，拿不到答案时记「跳过作答」并保存题目原始数据，同时新增可选的 AI 作答（`answer.source`）。
+- 支持带图片的题目：把题干 / 选项里的图片和所在课件整页图一起交给多模态模型，模型不支持图片时自动退回纯文字。
 - 给所有雨课堂请求补上超时，websocket 重连加了退避，cookie 失效会立刻提示并自动刷新二维码；同时进行多节课时会把候选都写进日志，并支持用 `lesson_filter` 指定课程。
 - 未改动的部分：`yuketang/util.py`、`qywxbot/send.py`，以及 `yuketang/yuketang.py` 的其余逻辑。
 

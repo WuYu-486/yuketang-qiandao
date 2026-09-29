@@ -192,7 +192,8 @@ class App:
         answer.setdefault("api_key_env", "")  # 想指定环境变量名时填这里，例如 DEEPSEEK-API-KEY
         answer.setdefault("base_url", "")     # 留空则按 Key 来源自动选（DeepSeek / 百炼）
         answer.setdefault("model", "")        # 留空同上，例如 deepseek-chat
-        answer.setdefault("timeout", 30)
+        answer.setdefault("send_images", True)  # 题目带图片时，把图片一起发给多模态模型
+        answer.setdefault("timeout", 60)
         save_json(CONFIG_PATH, cfg)
         return cfg
 

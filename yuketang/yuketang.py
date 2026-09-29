@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import websockets
 import json
 import requests
@@ -12,9 +13,9 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qywxbot.send import *
 try:
-    from ai_answer import solve_problem as ai_solve_problem
+    from ai_answer import solve_problem as ai_solve_problem, extract_image_urls
 except ImportError:          # 万一以包的形式被导入
-    from yuketang.ai_answer import solve_problem as ai_solve_problem
+    from yuketang.ai_answer import solve_problem as ai_solve_problem, extract_image_urls
 
 # 异常重试间隔（秒）。上游靠 start_time<6000 兜底退出，改成常驻监听后
 # 必须自己限速，否则登录态失效或断网时会变成不间隔的死循环猛刷服务端。
@@ -79,6 +80,21 @@ def _provider_hint(env_name):
     if "DASHSCOPE" in upper or "QWEN" in upper or "BAILIAN" in upper:
         return "dashscope"
     return ""
+
+
+def _guess_image_mime(data):
+    """图片服务器没给 Content-Type 时，按文件头猜一个"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    return "image/jpeg"
 
 
 def _has_content(value):
@@ -279,6 +295,7 @@ class yuketang:
         self.presentation=""
         self.problemid=""
         self.problems={}
+        self.problem_covers={}         # problemId -> 所在课件的整页图片，题目带图时交给模型
         self.lesson_filter=""          # 只签到课程名包含这个关键词的课（可留空）
         self.lesson_candidates=[]
         self._logged_candidates=None
@@ -292,6 +309,7 @@ class yuketang:
         self.answer_timeout=30
         self.answer_note=""
         self.answer_key_source=""
+        self.answer_send_images=True   # 题目里的图片要不要一起发给多模态模型
         self._hint_ai_shown=False
 
         self.debug=True
@@ -339,9 +357,13 @@ class yuketang:
         self.answer_model = str(cfg.get("model")
                                 or preset.get("model") or DEFAULT_AI_MODEL).strip()
         try:
-            self.answer_timeout = int(cfg.get("timeout") or 30)
+            self.answer_timeout = int(cfg.get("timeout") or 60)
         except (TypeError, ValueError):
-            self.answer_timeout = 30
+            self.answer_timeout = 60
+        send_images = cfg.get("send_images")
+        if isinstance(send_images, str):
+            send_images = send_images.strip().lower() not in ("", "0", "false", "no", "off")
+        self.answer_send_images = True if send_images is None else bool(send_images)
 
     def configure_checkin(self, source=None):
         """设置签到用的 source，决定雨课堂把这条考勤记成哪种“签到方式”"""
@@ -555,11 +577,19 @@ class yuketang:
             problem=slide.get("problem")
             if not isinstance(problem,dict):
                 continue
+            # 这页课件的整页图片（带 token 的签名地址），题目里有图时能派上用场
+            cover=""
+            for field in ("cover","coverAlt","thumbnail"):
+                if isinstance(slide.get(field),str) and slide[field].strip():
+                    cover=slide[field].strip()
+                    break
             # 服务端在 unlockproblem 里下发的是 problemId，上游只按 slide id 存，
             # 两者不一致时就找不到题目；这里两个 key 都存一份（统一按字符串）。
             for key in (problem.get("problemId"),slide.get("id")):
                 if key is not None:
                     self.problems[str(key)]=problem
+                    if cover:
+                        self.problem_covers[str(key)]=cover
         if slides!=self.slides:
             self.slides=slides
             self.msgmgr.sendMsg("成功获取幻灯片",user=self.name)
@@ -579,6 +609,51 @@ class yuketang:
         print(f"[雨课堂] 题目原始字段: {keys}")
         return path
 
+    def download_image(self,url,max_bytes=4*1024*1024):
+        """下载题目 / 课件里的图片，返回 data URL；失败返回空串（不影响作答）"""
+        if url.startswith("//"):
+            url="https:"+url
+        elif url.startswith("/"):
+            url="https://www.yuketang.cn"+url
+        if not url.lower().startswith("http"):
+            return ""
+        headers={
+            "referer":f"https://www.yuketang.cn/lesson/fullscreen/v3/{self.lessonId}?source={self.checkin_source}",
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "cookie":self.cookie
+        }
+        try:
+            res=requests.get(url,headers=headers,timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print(f"[雨课堂] 图片下载失败：{type(e).__name__}: {e}")
+            return ""
+        if res.status_code>=400 or not res.content:
+            print(f"[雨课堂] 图片下载失败：HTTP {res.status_code}")
+            return ""
+        data=res.content
+        if len(data)>max_bytes:
+            print(f"[雨课堂] 图片太大（{len(data)//1024} KB），已跳过")
+            return ""
+        mime=(res.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not mime.startswith("image/"):
+            mime=_guess_image_mime(data)
+        return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+    def collect_images(self,problem,problem_id,limit=3,max_bytes=4*1024*1024):
+        """题目会带图片时，把题干里的图片和这页课件的整页图一起准备给模型"""
+        if not self.answer_send_images:
+            return []
+        urls=extract_image_urls(problem)
+        cover=self.problem_covers.get(str(problem_id))
+        if cover and cover not in urls:
+            urls.append(cover)
+        images=[]
+        for url in urls[:limit]:
+            data=self.download_image(url,max_bytes)
+            if data:
+                images.append(data)
+        return images
+
     def answer(self,problem_id=None):
         problem_id=self.problemid if problem_id is None else problem_id
         # 用 get 而不是 []：本地没有这道题（比如课件还没同步过来）时，
@@ -596,8 +671,11 @@ class yuketang:
         answers=extract_server_answers(problem)
         source="雨课堂下发"
         if answers is None and self.answer_source in ("ai","auto"):
+            images=self.collect_images(problem,problem_id)
+            if images:
+                print(f"[雨课堂] 题目 {problem_id} 带 {len(images)} 张图片，一起交给模型识别")
             answers,note=ai_solve_problem(problem,self.answer_api_key,self.answer_base_url,
-                                          self.answer_model,self.answer_timeout)
+                                          self.answer_model,self.answer_timeout,images=images)
             if answers is None:
                 self.answer_note=note
             else:
