@@ -3,6 +3,16 @@
     "name": "me",
     "wx": false,
     "debug": true,
-    "open_qrcode": true
+    "open_qrcode": true,
+    "lesson_filter": "",
+    "checkin_source": 1,
+    "answer": {
+      "source": "auto",
+      "api_key": "",
+      "api_key_env": "",
+      "base_url": "",
+      "model": "",
+      "timeout": 30
+    }
   }
 }

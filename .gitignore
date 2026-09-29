@@ -12,3 +12,8 @@ accounts.json
 history_*.log
 log_*.log
 gui_error.log
+# 题目原始数据（排查答题问题时自动落盘）
+debug_problem_*.json
+debug_lessons_*.json
+# 可选：AI 作答用的 API Key
+dashscope_key.txt

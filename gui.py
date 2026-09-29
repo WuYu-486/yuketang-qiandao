@@ -43,12 +43,27 @@ MONO = ("Consolas", 9)
 QR_TTL = 115             # 服务端二维码 120 秒失效，这里留几秒余量
 QR_SIZE = 260
 MAX_KEEP_LINES = 800
+# 子进程这么久没有任何输出就提示可能卡死（run.py 正常时最多 10 分钟一条心跳）
+STALL_MINUTES = 20
 
 try:
     from PIL import Image, ImageTk
     HAS_PIL = True
 except Exception:
     HAS_PIL = False
+
+
+def child_env():
+    """子进程统一用 UTF-8 输出。
+
+    子进程的 stdout 是管道，Python 默认会按系统编码（中文 Windows 上是 GBK）
+    写出去，而界面这边按 UTF-8 解码，结果中文全变乱码，
+    连带“历史记录”里按关键字匹配签到 / 答题结果的规则也全部失效。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
 
 
 def qr_file_ok(path):
@@ -78,9 +93,12 @@ HISTORY_RULES = (
     ("cookie有效", "登录状态：cookie 有效"),
     ("cookie 已失效", "登录状态：cookie 已失效，需要重新扫码"),
     ("cookie已失效", "登录状态：cookie 已失效，需要重新扫码"),
+    ("登录已失效", "登录状态已失效，需要重新扫码"),
     ("检测到课程", "检测到正在上课，已发起签到"),
     ("课程结束了", "本节课程结束"),
     ("成功获取幻灯片", "获取到课件幻灯片"),
+    ("跳过作答", "这道题没有可用答案，已跳过"),
+    ("获取课件失败", "获取课件失败，稍后会自动重试"),
     ("出现异常", "运行异常，程序自动重试中"),
 )
 
@@ -109,7 +127,7 @@ def run_capture(args, timeout=90):
         res = subprocess.run(
             [PY, "-u"] + args, cwd=ROOT, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
-            creationflags=CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW, env=child_env(),
         )
         return (res.stdout or "") + (res.stderr or "")
     except Exception as e:
@@ -130,6 +148,8 @@ class Account:
         self.qr_photo = None
         self.qr_state = "empty"   # empty / waiting / fresh / broken / used
         self.start_at = None
+        self.last_event = None    # 最近一次收到子进程输出的时间，用来判断有没有卡死
+        self.wait_minutes = None  # 正在等课时，run.py 报上来的等待分钟数
         self.login_ok = None
         self.login_name = None
         self.lesson = None
@@ -164,6 +184,15 @@ class App:
         ykt["wx"] = False            # 不用企业微信推送
         ykt["debug"] = True          # 日志回显到界面
         ykt["open_qrcode"] = False   # 二维码显示在窗口里
+        ykt.setdefault("lesson_filter", "")   # 同时多节课时，只签到课程名含这个关键词的课
+        ykt.setdefault("checkin_source", 1)   # 签到方式：1=微信/扫二维码，5=公众号提示，详见 README
+        answer = ykt.setdefault("answer", {})
+        answer.setdefault("source", "auto")   # server=只用雨课堂下发的答案 / ai=只用大模型 / auto=优先下发、没有就用大模型
+        answer.setdefault("api_key", "")      # 留空则按 api_key_env → 常见环境变量 → dashscope_key.txt 依次找
+        answer.setdefault("api_key_env", "")  # 想指定环境变量名时填这里，例如 DEEPSEEK-API-KEY
+        answer.setdefault("base_url", "")     # 留空则按 Key 来源自动选（DeepSeek / 百炼）
+        answer.setdefault("model", "")        # 留空同上，例如 deepseek-chat
+        answer.setdefault("timeout", 30)
         save_json(CONFIG_PATH, cfg)
         return cfg
 
@@ -424,6 +453,8 @@ class App:
         acc.mode = mode
         acc.auto_start = auto_start
         acc.start_at = time.time()
+        acc.last_event = acc.start_at
+        acc.wait_minutes = None
         acc.qr_accept_after = acc.start_at - 2   # 只认这一轮新生成的二维码
         acc.session += 1
         session = acc.session
@@ -436,7 +467,7 @@ class App:
                 [PY, "-u"] + args, cwd=ROOT,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                errors="replace", creationflags=CREATE_NO_WINDOW)
+                errors="replace", creationflags=CREATE_NO_WINDOW, env=child_env())
         except Exception as e:
             self._append_log(name, f"[启动失败] {type(e).__name__}: {e}")
             return False
@@ -464,11 +495,16 @@ class App:
 
     def _start_login_selected(self, confirm=True):
         """刷新登录二维码：不管本地 cookie 有没有效，都强制拿一张新的二维码"""
-        name = self._selected_name()
+        return self._refresh_login(None, confirm)
+
+    def _refresh_login(self, name=None, confirm=True):
+        name = name or self._selected_name()
         if not name:
             messagebox.showinfo("提示", "先添加一个账号", parent=self.root)
             return
-        acc = self.accounts[name]
+        acc = self.accounts.get(name)
+        if acc is None:      # 账号可能已经被移除了
+            return
         busy = bool(acc.proc and acc.proc.poll() is None)
         if confirm and (busy or acc.login_ok is True):
             state = "正在监听" if busy else "已登录"
@@ -561,8 +597,18 @@ class App:
                         self._append_log(name, f"==== 扫码登录未完成（退出码 {payload}）====")
                         self._record(name, f"扫码登录未完成（退出码 {payload}）")
                 else:
-                    self._append_log(name, f"==== 监听结束（退出码 {payload}）====")
-                    self._record(name, f"监听结束（退出码 {payload}）")
+                    if payload == 3:
+                        # run.py 发现 cookie 失效会带退出码 3 收工：这边直接把
+                        # 二维码刷出来，不用你自己猜是不是掉线了
+                        acc.login_ok = False
+                        acc.wait_minutes = None
+                        self._append_log(name, "==== 登录已失效，需要重新扫码 ====")
+                        self._record(name, "登录已失效：需要重新扫码登录")
+                        self._set_status(f"{name} 登录已失效，正在刷新登录二维码")
+                        self.root.after(500, lambda n=name: self._refresh_login(n, confirm=False))
+                    else:
+                        self._append_log(name, f"==== 监听结束（退出码 {payload}）====")
+                        self._record(name, f"监听结束（退出码 {payload}）")
                 self._set_status(f"{name} 任务已结束")
                 if name == self._selected_name():
                     self._refresh_qr_panel(acc)
@@ -606,9 +652,17 @@ class App:
                 text=f"等待微信扫码（已等 {used} 分钟，二维码约 2 分钟换一次）",
                 foreground="#b26a00")
         elif running:
-            self.lbl_watch.configure(
-                text=f"监听：运行中（已运行 {used} 分钟，不会自动停止）",
-                foreground="#1a7f37")
+            idle = int((time.time() - (acc.last_event or acc.start_at or time.time())) / 60)
+            if acc.wait_minutes is not None:
+                text = f"监听：等课中（已等 {acc.wait_minutes} 分钟，不会自动停止）"
+            else:
+                text = f"监听：运行中（已运行 {used} 分钟，最近事件 {idle} 分钟前）"
+            if idle >= STALL_MINUTES:
+                # 子进程还在，但很久没有任何输出：大概率卡在某个网络请求上
+                text += f"！{idle} 分钟没有输出，可能卡住了"
+                self.lbl_watch.configure(text=text, foreground="#b26a00")
+            else:
+                self.lbl_watch.configure(text=text, foreground="#1a7f37")
         else:
             self.lbl_watch.configure(text="监听：未运行", foreground="#666666")
 
@@ -780,6 +834,13 @@ class App:
         acc = self.accounts.get(name)
         if acc is None:
             return
+        acc.last_event = time.time()
+        text = str(line)
+        if "等课中" in text:
+            match = re.search(r"已等\s*(\d+)\s*分钟", text)
+            acc.wait_minutes = int(match.group(1)) if match else 0
+        elif "检测到课程" in text or "签到成功" in text or "课程结束了" in text:
+            acc.wait_minutes = None
         for raw in (str(line).splitlines() or [""]):
             acc.lines.append(raw)
         if len(acc.lines) > MAX_KEEP_LINES:
@@ -824,7 +885,7 @@ class App:
     def _maybe_record(self, name, line):
         # 签到/作答结果单独处理：要把"题型/答案/失败原因"这些每次都不同的细节
         # 带进历史，不能像 HISTORY_RULES 那样只记一条固定文案。
-        for marker in ("签到成功", "签到失败", "答题成功", "答题失败"):
+        for marker in ("签到成功", "签到失败", "答题成功", "答题失败", "跳过作答"):
             if marker in line:
                 detail = line.split(marker, 1)[1].lstrip("：: ").strip()
                 self._record(name, f"{marker}：{detail}" if detail else marker)

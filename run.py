@@ -49,6 +49,9 @@ NET_TARGETS = [
     ("雨课堂接口", "https://www.yuketang.cn/api/v3/user/basic-info"),
 ]
 
+# 退出码：界面靠它判断“要不要弹二维码”
+EXIT_LOGIN_EXPIRED = 3
+
 
 # ---------------------------------------------------------------- 配置
 
@@ -269,6 +272,63 @@ def cmd_login(cfg, name=None):
 
 # ---------------------------------------------------------------- 监听与自动答题
 
+def _wait_for_lesson(ykt, ykmod):
+    """等一节课开始。
+
+    顺手每 5 分钟验一次 cookie：登录态失效就抛 LoginExpired 让界面弹二维码，
+    而不是像以前那样一声不吭地等一整天。
+    """
+    waited = 0
+    while True:
+        if ykt.cookie_invalid():
+            raise ykmod.LoginExpired("cookie 已失效")
+        try:
+            if ykt.getlesson():
+                return
+        except Exception as e:
+            print(f"[雨课堂] 查询课程失败：{type(e).__name__}: {e}（30 秒后重试）")
+        time.sleep(30)
+        waited += 30
+        if waited % 600 == 0:      # 每 10 分钟报一次，免得看起来像卡死
+            print(f"[雨课堂] 等课中：已等 {waited // 60} 分钟，不手动关闭就一直等")
+
+
+def _wait_lesson_end(ykt, ykmod, lesson_id):
+    """签到失败时不要再反复重试签到，等这节课结束再回到等课流程"""
+    waited = 0
+    while waited < 2 * 3600:
+        if ykt.cookie_invalid():
+            raise ykmod.LoginExpired("cookie 已失效")
+        try:
+            still_on = ykt.getlesson() and str(ykt.lessonId) == str(lesson_id)
+        except Exception:
+            still_on = True
+        if not still_on:
+            return
+        time.sleep(30)
+        waited += 30
+    print("[雨课堂] 这节课已经等了 2 小时，先回到等课流程")
+
+
+def _listen_forever(ykt, ykmod):
+    """等课 → 签到 → 跟课，一节接一节，直到进程被关掉"""
+    while True:
+        _wait_for_lesson(ykt, ykmod)
+        print(f"[雨课堂] 检测到课程 lessonId={ykt.lessonId}，开始签到")
+        try:
+            ykt.lesson_checkin()
+        except ykmod.LoginExpired:
+            raise
+        except Exception as e:
+            print(f"[雨课堂] 签到失败：{type(e).__name__}: {e}")
+            print("[雨课堂] 这节课不再重复签到，等它结束后继续等下一节课 ...")
+            _wait_lesson_end(ykt, ykmod, ykt.lessonId)
+            continue
+        ykt.ws_controller(ykt.ws_lesson)
+        print("[雨课堂] 本节监听结束，继续等下一节课 ..."
+              "（Ctrl+C 或界面“停止”才会退出）")
+
+
 def cmd_ykt(cfg, name=None):
     import yuketang as ykmod
 
@@ -291,34 +351,28 @@ def cmd_ykt(cfg, name=None):
     ykt = ykmod.yuketang(name)
     ykt.msgmgr.debug = bool(cfg_ykt["debug"])
     ykt.msgmgr.wx = wx
+    ykt.lesson_filter = (cfg_ykt.get("lesson_filter") or "").strip()
+    ykt.configure_answer(cfg_ykt.get("answer") or {})
+    ykt.configure_checkin(cfg_ykt.get("checkin_source"))
 
     print("[雨课堂] 等待有课进行中（每 30 秒查一次，不会自动退出）...")
-    waited = 0
+    print(f"[雨课堂] 签到方式：{ykt.checkin_source_desc()}")
+    print(f"[雨课堂] 作答来源：{ykt.answer_source_desc()}")
     # 常驻监听：去掉原来 count>200（约 100 分钟）的等课超时，
     # 外层再套一层循环，一节课结束后回去等下一节课，直到手动关闭。
     while True:
         try:
-            while not ykt.getlesson():
-                time.sleep(30)
-                waited += 30
-                if waited % 600 == 0:      # 每 10 分钟报一次，免得看起来像卡死
-                    print(f"[雨课堂] 仍在等课（已等 {waited // 60} 分钟），"
-                          f"不手动关闭就一直等")
-            print(f"[雨课堂] 检测到课程 lessonId={ykt.lessonId}，开始签到")
-            waited = 0
-            ykt.lesson_checkin()
-            ykt.ws_controller(ykt.ws_lesson)
+            _listen_forever(ykt, ykmod)
+        except ykmod.LoginExpired:
+            print("[雨课堂] 登录已失效：本地登录状态已经不能用了，需要重新扫码登录")
+            return EXIT_LOGIN_EXPIRED
         except KeyboardInterrupt:
             raise
         except Exception:
-            # getlesson()/lesson_checkin() 上游都没设超时也没容错，网络抖一下
-            # 原来会直接结束进程；改成常驻后这里兜住，睡 30 秒继续等课
+            # 兜底：网络抖一下不要杀掉进程，睡 30 秒继续
             traceback.print_exc()
             print("[雨课堂] 本轮出错，30 秒后重试（不会退出）")
             time.sleep(30)
-            continue
-        print("[雨课堂] 本节监听结束，继续等下一节课 ..."
-              "（Ctrl+C 或界面“停止”才会退出）")
 
 
 # ---------------------------------------------------------------- 菜单
