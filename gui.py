@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime
 
 try:
     import tkinter as tk
@@ -103,6 +104,34 @@ HISTORY_RULES = (
 )
 
 
+def parse_schedule(text):
+    """把用户填的时间解析成时间戳。
+
+    支持两种写法：纯数字 = 多少分钟后（最小 1 分钟）；
+    13:50 这种时刻 = 今天的这个点，已经过了就顺延到明天。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d{1,2})[:：.](\d{1,2})$", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if hour > 23 or minute > 59:
+            return None
+        now = datetime.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        return target.timestamp()
+    try:
+        minutes = float(text)
+    except ValueError:
+        return None
+    if minutes < 1:          # 最小单位是分钟
+        return None
+    return time.time() + minutes * 60
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -153,6 +182,7 @@ class Account:
         self.login_ok = None
         self.login_name = None
         self.lesson = None
+        self.sched_at = None      # 定时开始监听的时间戳（每个账号独立）
 
 
 class App:
@@ -231,6 +261,8 @@ class App:
 
         ttk.Button(left, text="添加账号", command=self._add_account).pack(fill="x", pady=1)
         ttk.Button(left, text="移除账号", command=self._remove_account).pack(fill="x", pady=1)
+        ttk.Button(left, text="定时开始监听", command=self._schedule_start).pack(fill="x", pady=1)
+        ttk.Button(left, text="取消定时", command=self._cancel_schedule).pack(fill="x", pady=1)
         ttk.Button(left, text="环境自检", command=self._selfcheck).pack(fill="x", pady=(8, 1))
 
         right = ttk.Frame(main)
@@ -318,12 +350,24 @@ class App:
             names = [self.cfg.get("yuketang", {}).get("name") or "me"]
         for name in names:
             self._new_account(name, select=False)
+        # 恢复上次设的定时：到点的还没过多久就直接开始，超过 2 小时的旧定时丢掉
+        now = time.time()
+        for name, value in (data.get("schedules") or {}).items():
+            acc = self.accounts.get(name)
+            if acc is None or not isinstance(value, (int, float)):
+                continue
+            if value > now or now - value <= 2 * 3600:
+                acc.sched_at = float(value)
         self._refresh_tree()
         last = data.get("last")
         self._select(last if last in self.accounts else names[0])
 
     def _save_accounts(self):
-        save_json(ACCOUNTS_PATH, {"accounts": list(self.accounts), "last": self._selected_name()})
+        schedules = {name: int(acc.sched_at)
+                     for name, acc in self.accounts.items() if acc.sched_at}
+        save_json(ACCOUNTS_PATH, {"accounts": list(self.accounts),
+                                  "last": self._selected_name(),
+                                  "schedules": schedules})
 
     def _new_account(self, name, select=True):
         acc = Account(name)
@@ -489,6 +533,10 @@ class App:
         if acc.proc and acc.proc.poll() is None:
             messagebox.showinfo("提示", f"「{name}」正在运行中，先点“停止”再开始", parent=self.root)
             return
+        if acc.sched_at:          # 手动开始了，原定定时就没用了
+            acc.sched_at = None
+            self._save_accounts()
+            self._append_log(name, "==== 手动开始监听，已取消原来的定时 ====")
         if self._begin_process(name, ["run.py", "ykt", "--name", name], "listen",
                                banner="开始监听"):
             self._record(name, "开始监听")
@@ -530,6 +578,73 @@ class App:
                                auto_start=True, banner="刷新登录二维码"):
             self._record(name, "开始扫码登录")
             self._set_status(f"{name} 正在获取新的登录二维码")
+
+    def _schedule_start(self):
+        """给当前账号定个时间，到点自动开始监听（每个账号各算各的，最小 1 分钟）"""
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("提示", "先添加一个账号", parent=self.root)
+            return
+        acc = self.accounts[name]
+        hint = ""
+        if acc.sched_at:
+            hint = f"（现在定在 {time.strftime('%m-%d %H:%M', time.localtime(acc.sched_at))}）"
+        text = simpledialog.askstring(
+            "定时开始监听",
+            f"给「{name}」定个时间{hint}：\n\n"
+            "· 多少分钟后开始：填 30 这样的分钟数\n"
+            "· 几点开始：填 13:50 这样的时刻，已经过了就算明天",
+            parent=self.root)
+        if not text:
+            return
+        target = parse_schedule(text)
+        if target is None:
+            messagebox.showerror("时间看不懂",
+                                 "请填分钟的分钟数（如 30，最小 1）或时刻（如 13:50）",
+                                 parent=self.root)
+            return
+        acc.sched_at = target
+        self._save_accounts()
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(target))
+        left = max(int(round((target - time.time()) / 60)), 0)
+        self._append_log(name, f"==== 已定时：{stamp} 自动开始监听 ====")
+        self._record(name, f"已设置定时开始监听：{stamp}")
+        self._set_status(f"{name} 将在 {stamp}（约 {left} 分钟后）自动开始监听")
+        self._refresh_tree()
+        self._update_current_card()
+
+    def _cancel_schedule(self):
+        name = self._selected_name()
+        if not name or not self.accounts[name].sched_at:
+            self._set_status("当前账号没有设置定时")
+            return
+        acc = self.accounts[name]
+        acc.sched_at = None
+        self._save_accounts()
+        self._append_log(name, "==== 已取消定时开始监听 ====")
+        self._record(name, "已取消定时开始监听")
+        self._set_status(f"{name} 的定时已取消")
+        self._refresh_tree()
+        self._update_current_card()
+
+    def _fire_scheduled_start(self, name):
+        """到点了：开始监听（该账号独立计时，到点各走各的）"""
+        acc = self.accounts.get(name)
+        if acc is None:
+            return
+        acc.sched_at = None
+        self._save_accounts()
+        stamp = time.strftime("%H:%M:%S")
+        if acc.proc and acc.proc.poll() is None:
+            self._append_log(name, f"==== 定时到点（{stamp}），但已经在运行中，跳过 ====")
+            self._record(name, "定时到点，但账号已在运行，跳过")
+            return
+        self._append_log(name, f"==== 定时到点，开始监听 {stamp} ====")
+        self._record(name, "定时到点，自动开始监听")
+        if self._begin_process(name, ["run.py", "ykt", "--name", name], "listen",
+                               banner="定时自动开始监听"):
+            self._set_status(f"{name} 定时到点，已开始监听")
+            self._append_log(name, "（如果登录状态已失效，选中这个账号就能看到二维码）")
 
     def _auto_start_listener(self, name):
         acc = self.accounts.get(name)
@@ -625,6 +740,10 @@ class App:
     def _tick(self):
         for name, acc in list(self.accounts.items()):
             self._check_qr(name, acc)
+        now = time.time()
+        for name, acc in list(self.accounts.items()):
+            if acc.sched_at and now >= acc.sched_at:
+                self._fire_scheduled_start(name)
         name = self._selected_name()
         if name:
             self._refresh_qr_panel(self.accounts.get(name))
@@ -664,6 +783,12 @@ class App:
                 self.lbl_watch.configure(text=text, foreground="#b26a00")
             else:
                 self.lbl_watch.configure(text=text, foreground="#1a7f37")
+        elif acc.sched_at:
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(acc.sched_at))
+            left = max(int(round((acc.sched_at - time.time()) / 60)), 0)
+            self.lbl_watch.configure(
+                text=f"监听：已定时（{stamp} 自动开始，还剩约 {left} 分钟）",
+                foreground="#1f6feb")
         else:
             self.lbl_watch.configure(text="监听：未运行", foreground="#666666")
 
@@ -677,6 +802,9 @@ class App:
                 continue
             if acc.proc and acc.proc.poll() is None:
                 state = "监听中"
+            elif acc.sched_at:
+                left = max(int(round((acc.sched_at - time.time()) / 60)), 0)
+                state = f"定时{left}分"
             elif acc.login_ok is True:
                 state = "已登录"
             elif acc.login_ok is False:
