@@ -183,35 +183,95 @@ def option_key_list(problem):
     return keys
 
 
+# 答案里常见的装饰性字符，比较时忽略掉
+_ANSWER_NOISE = " \t\r\n.,，。、:：;；!！?？\"'“”‘’()（）[]【】{}<>《》"
+
+
+def _norm_text(value):
+    """去掉空白和常见标点、把全角字母转半角，方便宽松比较"""
+    out = []
+    for char in str(value):
+        if char in _ANSWER_NOISE:
+            continue
+        if "Ａ" <= char <= "Ｚ":
+            char = chr(ord(char) - 0xFEE0)
+        elif "ａ" <= char <= "ｚ":
+            char = chr(ord(char) - 0xFEE0)
+        out.append(char)
+    return "".join(out).strip().upper()
+
+
+def _answer_items(answers):
+    """把答案拍平成列表，兼容 dict、嵌套 list 这些写法"""
+    if answers is None:
+        return []
+    if isinstance(answers, dict):
+        for field in ("answers", "answer", "key", "keys", "value", "result", "text"):
+            if field in answers:
+                return _answer_items(answers[field])
+        return [item for item in answers.values() if _has_content(item)]
+    if isinstance(answers, (list, tuple)):
+        out = []
+        for item in answers:
+            out.extend(_answer_items(item))
+        return out
+    if isinstance(answers, (str, int, float)):
+        return [answers] if _has_content(answers) else []
+    return []
+
+
 def _match_option_key(value, keys, problem):
-    """把模型 / 服务端给的答案映射成选项的 key"""
+    """把模型 / 服务端给的答案映射成选项的 key。
+
+    模型经常不老实照抄，会出现 "B."、"（B）"、"答案：B"、"B 共模信号"
+    甚至直接把选项文字抄回来这些写法，这里逐层放宽匹配。
+    """
     text = str(value).strip()
     if not text:
         return None
+    options = problem.get("options") or []
+    norm = _norm_text(text)
+    if not norm:
+        return None
+
+    # 1) 和选项 key 直接比
     for key in keys:
-        if text == str(key).strip():
+        if norm == _norm_text(key):
             return key
-    upper = text.upper()
-    for key in keys:
-        if upper == str(key).strip().upper():
+    # 2) 和选项文字直接比
+    for key, option in zip(keys, options):
+        body = option.get("value") if isinstance(option, dict) else option
+        if body is not None and _norm_text(body) == norm:
             return key
-    # A / B / C / D 这类字母
-    if len(text) == 1 and text.isalpha():
-        index = ord(upper) - ord("A")
-        if 0 <= index < len(keys):
-            return keys[index]
-    # 纯数字：先按 1 开始，再按 0 开始
-    if text.isdigit():
-        number = int(text)
+
+    # 3) 开头就是选项字母，比如 "B."、"（B）"、"B、共模信号"
+    head = norm[:1]
+    if head.isalpha() and "A" <= head <= "Z":
+        tail = norm[1:2]
+        if len(norm) == 1 or not tail.isalpha():
+            index = ord(head) - ord("A")
+            if 0 <= index < len(keys):
+                return keys[index]
+    # 4) 纯数字：先按 1 开始，再按 0 开始
+    if norm.isdigit():
+        number = int(norm)
         if 1 <= number <= len(keys):
             return keys[number - 1]
         if 0 <= number < len(keys):
             return keys[number]
-    # 直接给的是选项文字
-    for key, option in zip(keys, problem.get("options") or []):
+    # 5) 答案里夹着选项原文（比如 "我选共模信号"）
+    for key, option in zip(keys, options):
         body = option.get("value") if isinstance(option, dict) else option
-        if body is not None and text == str(body).strip():
+        if body is None:
+            continue
+        body_norm = _norm_text(body)
+        if len(body_norm) >= 2 and (body_norm in norm or (len(norm) >= 2 and norm in body_norm)):
             return key
+    # 6) 整句里只出现了一个选项字母，比如 "我选B"
+    if keys and all(isinstance(key, str) and key.isalpha() for key in keys):
+        hit = [key for key in keys if _norm_text(key) in norm]
+        if len(hit) == 1:
+            return hit[0]
     return None
 
 
@@ -221,14 +281,7 @@ def normalize_result(problem, answers):
     选择题提交的是选项 key 列表；填空题是每空一个字符串；主观题是一段文本。
     整理不出有效答案时返回 None（上层就会记成“跳过作答”，而不是提交空答案）。
     """
-    if answers is None:
-        return None
-    if isinstance(answers, (str, int, float)):
-        answers = [answers]
-    if not isinstance(answers, (list, tuple)):
-        return None
-
-    items = [item for item in answers if _has_content(item)]
+    items = _answer_items(answers)
     if not items:
         return None
 
@@ -246,11 +299,25 @@ def normalize_result(problem, answers):
         return result[:count]
 
     keys = option_key_list(problem)
+    can_split = bool(keys) and all(isinstance(key, str) and key.isalpha() for key in keys)
+    key_letters = {_norm_text(key) for key in keys}
     result = []
     for item in items:
         key = _match_option_key(item, keys, problem) if keys else item
-        if key is not None and key not in result:
-            result.append(key)
+        if key is not None:
+            if key not in result:
+                result.append(key)
+            continue
+        # 多选题模型常写成 "BC"、"A,C"、"A和C"，整体匹配不上就拆成单个选项
+        if can_split:
+            letters = [char for char in _norm_text(item) if "A" <= char <= "Z"]
+            if len(letters) >= 2 and all(char in key_letters for char in letters):
+                for char in dict.fromkeys(letters):
+                    single = _match_option_key(char, keys, problem)
+                    if single is not None and single not in result:
+                        result.append(single)
+    if problem_type in (1, 6):       # 单选 / 判断题只保留一个答案
+        result = result[:1]
     return result or None
 
 
@@ -688,9 +755,12 @@ class yuketang:
             # 不再把空答案当成作答成功提交上去。
             if answers is None:
                 reason=self.answer_note or "雨课堂没有下发这道题的答案"
+                extra=""
             else:
-                reason="答案数据解析不出有效内容"
-            detail=f"题型={type_name}"
+                # 把模型原样给的答案也记下来，方便回头查是哪一步对不上
+                reason="答案解析不出有效内容"
+                extra=f"，拿到的答案为 {answers!r}"
+            detail=f"题型={type_name}{extra}"
             saved=self.dump_problem(problem,problem_id)
             if saved:
                 detail+=f"，原始数据已存 {os.path.basename(saved)}"
