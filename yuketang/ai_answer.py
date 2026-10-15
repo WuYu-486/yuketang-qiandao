@@ -124,19 +124,37 @@ def build_messages(problem, images=None):
             lines.append(f"  {key}: {text}")
 
     if problem_type == 4:
-        lines.append(f"这是一道填空题，一共有 {blank_count(problem)} 个空。")
-        lines.append('请只输出 JSON：{"answers": ["第一空的答案", "第二空的答案"]}')
+        count = blank_count(problem)
+        lines += [f"这是一道填空题，一共 {count} 个空。",
+                  f'只输出 JSON，answers 里按空序放 {count} 个答案文本：{{"answers": ["第一空", "第二空"]}}',
+                  "要求：",
+                  "1. answers 的个数必须等于空的个数，按空序排列；",
+                  "2. 答案是文本本身，不要写“第1空”这类提示，不要带序号、括号或句号。"]
     elif problem_type == 5:
-        lines.append("这是一道主观题，答案请写得简短、直接。")
-        lines.append('请只输出 JSON：{"answers": ["你的答案"]}')
+        lines += ["这是一道主观题，答案写简短、直接。",
+                  '只输出 JSON：{"answers": ["你的答案"]}']
     elif options:
-        lines.append("answers 里必须原样照抄上面选项的 key，不要改写、不要只写序号。")
-        lines.append('请只输出 JSON：{"answers": ["选项的 key"]}，多选题把正确的 key 都列出来。')
+        keys_text = "、".join(str(key) for key, _ in options)
+        lines += [f"选项标识只有这些：{keys_text}",
+                  '只输出 JSON：{"answers": ["选项标识"]}',
+                  "要求：",
+                  f"1. answers 里只能放上面列出的标识本身（{keys_text}），其它值一律不行；",
+                  '2. 不要带选项原文、序号、括号、句号或说明，不要写成 "B."、"（B）"、'
+                  '"答案：B"、"B 共模信号" 这类形式；']
+        if problem_type in (2, 3):
+            lines += ['3. 多选的正确项要全部列出，每项单独一个字符串，'
+                      '例如 {"answers": ["B", "C"]}，不要写成 "BC"；',
+                      "4. 不确定也要选，不要留空、不要回答“不知道”。"]
+        else:
+            lines += ['3. 只放一个标识，例如 {"answers": ["B"]}；',
+                      "4. 不确定也要选一个最可能的，不要留空、不要回答“不知道”。"]
     else:
-        lines.append('请只输出 JSON：{"answers": ["你的答案"]}')
+        lines += ['只输出 JSON：{"answers": ["你的答案"]}',
+                  "不确定也要给出一个最可能的答案，不要留空。"]
 
     system = ("你是一个正在上课的学生，需要作答雨课堂课内题。"
-              "只输出 JSON，不要解释，不要用 Markdown 代码块。")
+              "任何情况下都只输出一个 JSON 对象：不要解释、不要复述题目、"
+              "不要用 Markdown 代码块，也不要在 JSON 前后加任何文字或标点。")
     text = "\n".join(lines)
 
     if images:
@@ -192,27 +210,29 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
         "Content-Type": "application/json",
     }
 
-    def post(with_images):
+    def post(with_images, json_mode=True):
         payload = {
             "model": model,
             "messages": build_messages(problem, with_images),
             "temperature": 0.2,
         }
+        if json_mode:
+            # 让接口层强制输出 JSON，模型就没法在前后加解释
+            payload["response_format"] = {"type": "json_object"}
         return requests.post(url, headers=headers, json=payload, timeout=timeout)
 
     note_suffix = ""
     try:
         res = post(images if images else None)
+        if res.status_code >= 400:
+            # 有些服务不支持 response_format，去掉这个参数再试一次
+            res = post(images if images else None, json_mode=False)
+        if res.status_code >= 400 and images:
+            # 模型 / 接口不接受图片时退回纯文字，至少别把这道题整个丢掉
+            note_suffix = "，图片没被接受已按纯文字作答"
+            res = post(None, json_mode=False)
     except Exception as e:
         return None, f"请求大模型失败：{type(e).__name__}: {e}"
-
-    if res.status_code >= 400 and images:
-        # 模型 / 接口不接受图片时退回纯文字，至少别把这道题整个丢掉
-        note_suffix = "，图片没被接受已按纯文字作答"
-        try:
-            res = post(None)
-        except Exception as e:
-            return None, f"请求大模型失败：{type(e).__name__}: {e}"
 
     if res.status_code >= 400:
         return None, f"大模型返回 HTTP {res.status_code}：{res.text[:160]}"
