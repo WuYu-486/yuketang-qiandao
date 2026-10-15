@@ -26,8 +26,9 @@ REQUEST_TIMEOUT = 15
 # 课内监听的心跳间隔（秒）：这么久没收到任何服务端事件就打印一行心跳，
 # 让界面和日志知道进程还活着。
 HEARTBEAT_INTERVAL = 300
-# 交答案前随机等待的秒数区间（之前是阻塞式 sleep，会拖垮 websocket 心跳）
-ANSWER_DELAY_RANGE = (10, 20)
+# 交答案前随机等待的秒数区间。大模型本身还要思考几秒，这里只留一点缓冲，
+# 等太久容易撞上题目关闭时间。想调就改这一行。
+ANSWER_DELAY_RANGE = (3, 5)
 
 # 支持的大模型服务商（都是 OpenAI 兼容接口）
 AI_PROVIDERS = {
@@ -847,7 +848,7 @@ class yuketang:
     async def delayed_answer(self,problem_id):
         """等一小会儿再提交答案。
 
-        原来这里是 time.sleep(randint(10,20))：同步阻塞会把整个 websocket
+        上游原本用阻塞式 time.sleep 等这段延迟：同步阻塞会把整个 websocket
         事件循环按住，服务端心跳超时后就把连接踢掉（日志里那些
         keepalive ping timeout 就是这么来的）。改成 asyncio.sleep，
         再把阻塞的作答请求丢进线程池。
