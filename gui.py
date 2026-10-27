@@ -3,6 +3,7 @@
 lazytool 雨课堂图形界面（tkinter + 标准库，可选 Pillow 用于显示二维码）
 
 启动:
+    gui.pyw                                      双击启动（无控制台窗口，不会触发批处理安全警告）
     gui.bat                                      双击启动（无控制台窗口）
     .venv\\Scripts\\python.exe gui.py             带控制台启动，方便看报错
     .venv\\Scripts\\python.exe gui.py --selftest  只构建界面做自检，不进事件循环
