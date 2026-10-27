@@ -183,6 +183,7 @@ class Account:
         self.login_name = None
         self.lesson = None
         self.sched_at = None      # 定时开始监听的时间戳（每个账号独立）
+        self.stop_at = None       # 定时停止监听的时间戳（每个账号独立）
 
 
 class App:
@@ -262,6 +263,7 @@ class App:
         ttk.Button(left, text="添加账号", command=self._add_account).pack(fill="x", pady=1)
         ttk.Button(left, text="移除账号", command=self._remove_account).pack(fill="x", pady=1)
         ttk.Button(left, text="定时开始监听", command=self._schedule_start).pack(fill="x", pady=1)
+        ttk.Button(left, text="定时停止监听", command=self._schedule_stop).pack(fill="x", pady=1)
         ttk.Button(left, text="取消定时", command=self._cancel_schedule).pack(fill="x", pady=1)
         ttk.Button(left, text="环境自检", command=self._selfcheck).pack(fill="x", pady=(8, 1))
 
@@ -358,6 +360,13 @@ class App:
                 continue
             if value > now or now - value <= 2 * 3600:
                 acc.sched_at = float(value)
+        # 停止定时只恢复还没到点的：启动时没有在跑的子进程，过期的停止时间没有意义
+        for name, value in (data.get("stops") or {}).items():
+            acc = self.accounts.get(name)
+            if acc is None or not isinstance(value, (int, float)):
+                continue
+            if value > now:
+                acc.stop_at = float(value)
         self._refresh_tree()
         last = data.get("last")
         self._select(last if last in self.accounts else names[0])
@@ -365,9 +374,12 @@ class App:
     def _save_accounts(self):
         schedules = {name: int(acc.sched_at)
                      for name, acc in self.accounts.items() if acc.sched_at}
+        stops = {name: int(acc.stop_at)
+                 for name, acc in self.accounts.items() if acc.stop_at}
         save_json(ACCOUNTS_PATH, {"accounts": list(self.accounts),
                                   "last": self._selected_name(),
-                                  "schedules": schedules})
+                                  "schedules": schedules,
+                                  "stops": stops})
 
     def _new_account(self, name, select=True):
         acc = Account(name)
@@ -613,16 +625,57 @@ class App:
         self._refresh_tree()
         self._update_current_card()
 
-    def _cancel_schedule(self):
+    def _schedule_stop(self):
+        """给当前账号定个时间，到点自动停止监听（每个账号各算各的，最小 1 分钟）"""
         name = self._selected_name()
-        if not name or not self.accounts[name].sched_at:
-            self._set_status("当前账号没有设置定时")
+        if not name:
+            messagebox.showinfo("提示", "先添加一个账号", parent=self.root)
             return
         acc = self.accounts[name]
-        acc.sched_at = None
+        hint = ""
+        if acc.stop_at:
+            hint = f"（现在定在 {time.strftime('%m-%d %H:%M', time.localtime(acc.stop_at))}）"
+        text = simpledialog.askstring(
+            "定时停止监听",
+            f"给「{name}」定个时间{hint}：\n\n"
+            "· 多少分钟后停止：填 30 这样的分钟数\n"
+            "· 几点停止：填 13:50 这样的时刻，已经过了就算明天",
+            parent=self.root)
+        if not text:
+            return
+        target = parse_schedule(text)
+        if target is None:
+            messagebox.showerror("时间看不懂",
+                                 "请填分钟的分钟数（如 30，最小 1）或时刻（如 13:50）",
+                                 parent=self.root)
+            return
+        acc.stop_at = target
         self._save_accounts()
-        self._append_log(name, "==== 已取消定时开始监听 ====")
-        self._record(name, "已取消定时开始监听")
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(target))
+        left = max(int(round((target - time.time()) / 60)), 0)
+        self._append_log(name, f"==== 已定时：{stamp} 自动停止监听 ====")
+        self._record(name, f"已设置定时停止监听：{stamp}")
+        self._set_status(f"{name} 将在 {stamp}（约 {left} 分钟后）自动停止监听")
+        self._refresh_tree()
+        self._update_current_card()
+
+    def _cancel_schedule(self):
+        name = self._selected_name()
+        acc = self.accounts.get(name) if name else None
+        if acc is None or (not acc.sched_at and not acc.stop_at):
+            self._set_status("当前账号没有设置定时")
+            return
+        kinds = []
+        if acc.sched_at:
+            kinds.append("开始")
+        if acc.stop_at:
+            kinds.append("停止")
+        acc.sched_at = None
+        acc.stop_at = None
+        self._save_accounts()
+        label = "和".join(kinds)
+        self._append_log(name, f"==== 已取消定时{label}监听 ====")
+        self._record(name, f"已取消定时{label}监听")
         self._set_status(f"{name} 的定时已取消")
         self._refresh_tree()
         self._update_current_card()
@@ -646,6 +699,30 @@ class App:
             self._set_status(f"{name} 定时到点，已开始监听")
             self._append_log(name, "（如果登录状态已失效，选中这个账号就能看到二维码）")
 
+    def _fire_scheduled_stop(self, name):
+        """到点了：停止监听（和定时开始一样，每个账号各走各的）"""
+        acc = self.accounts.get(name)
+        if acc is None:
+            return
+        acc.stop_at = None
+        self._save_accounts()
+        stamp = time.strftime("%H:%M:%S")
+        if not (acc.proc and acc.proc.poll() is None):
+            self._append_log(name, f"==== 定时到点（{stamp}），但当前没有在运行，跳过 ====")
+            self._record(name, "定时到点，但账号没有在运行，跳过")
+            return
+        try:
+            acc.proc.terminate()
+        except Exception as e:
+            # 这里是 Tk 的定时回调，抛出去会让整个 _tick 循环停摆，所以就地兜住
+            self._append_log(name, f"==== 定时停止失败：{type(e).__name__}: {e} ====")
+            self._record(name, f"定时停止失败：{type(e).__name__}: {e}")
+            self._set_status(f"{name} 定时停止失败，详见运行日志")
+            return
+        self._append_log(name, f"==== 定时到点（{stamp}），停止监听 ====")
+        self._record(name, "定时到点，自动停止监听")
+        self._set_status(f"{name} 定时到点，已停止监听")
+
     def _auto_start_listener(self, name):
         acc = self.accounts.get(name)
         if acc is None or (acc.proc and acc.proc.poll() is None):
@@ -661,6 +738,10 @@ class App:
             return
         acc = self.accounts[name]
         if acc.proc and acc.proc.poll() is None:
+            if acc.stop_at:       # 手动停止了，原定定时停止就没用了
+                acc.stop_at = None
+                self._save_accounts()
+                self._append_log(name, "==== 手动停止监听，已取消原来的定时停止 ====")
             acc.proc.terminate()
             self._append_log(name, f"==== 界面请求停止 {time.strftime('%H:%M:%S')} ====")
             self._set_status(f"{name} 正在停止")
@@ -744,6 +825,10 @@ class App:
         for name, acc in list(self.accounts.items()):
             if acc.sched_at and now >= acc.sched_at:
                 self._fire_scheduled_start(name)
+        # 停止放在开始之后：同一分钟两个定时都到点时，以停止为准
+        for name, acc in list(self.accounts.items()):
+            if acc.stop_at and now >= acc.stop_at:
+                self._fire_scheduled_stop(name)
         name = self._selected_name()
         if name:
             self._refresh_qr_panel(self.accounts.get(name))
@@ -767,28 +852,42 @@ class App:
 
         running = bool(acc.proc and acc.proc.poll() is None)
         used = int((time.time() - (acc.start_at or time.time())) / 60)
+        stop_hint = ""
+        if acc.stop_at:
+            stop_hint = f"，{time.strftime('%H:%M', time.localtime(acc.stop_at))} 自动停止"
         if running and acc.mode == "login":
             self.lbl_watch.configure(
-                text=f"等待微信扫码（已等 {used} 分钟，二维码约 2 分钟换一次）",
+                text=f"等待微信扫码（已等 {used} 分钟，二维码约 2 分钟换一次{stop_hint}）",
                 foreground="#b26a00")
         elif running:
             idle = int((time.time() - (acc.last_event or acc.start_at or time.time())) / 60)
             if acc.wait_minutes is not None:
-                text = f"监听：等课中（已等 {acc.wait_minutes} 分钟，不会自动停止）"
+                tail = stop_hint.lstrip("，") if stop_hint else "不会自动停止"
+                text = f"监听：等课中（已等 {acc.wait_minutes} 分钟，{tail}）"
             else:
-                text = f"监听：运行中（已运行 {used} 分钟，最近事件 {idle} 分钟前）"
+                text = (f"监听：运行中（已运行 {used} 分钟，"
+                        f"最近事件 {idle} 分钟前{stop_hint}）")
             if idle >= STALL_MINUTES:
                 # 子进程还在，但很久没有任何输出：大概率卡在某个网络请求上
                 text += f"！{idle} 分钟没有输出，可能卡住了"
                 self.lbl_watch.configure(text=text, foreground="#b26a00")
             else:
                 self.lbl_watch.configure(text=text, foreground="#1a7f37")
-        elif acc.sched_at:
-            stamp = time.strftime("%m-%d %H:%M", time.localtime(acc.sched_at))
-            left = max(int(round((acc.sched_at - time.time()) / 60)), 0)
-            self.lbl_watch.configure(
-                text=f"监听：已定时（{stamp} 自动开始，还剩约 {left} 分钟）",
-                foreground="#1f6feb")
+        elif acc.sched_at or acc.stop_at:
+            start_stamp = (time.strftime("%m-%d %H:%M", time.localtime(acc.sched_at))
+                           if acc.sched_at else "")
+            stop_stamp = (time.strftime("%m-%d %H:%M", time.localtime(acc.stop_at))
+                          if acc.stop_at else "")
+            if start_stamp and stop_stamp:
+                text = f"监听：已定时（{start_stamp} 自动开始 / {stop_stamp} 自动停止）"
+            elif start_stamp:
+                left = max(int(round((acc.sched_at - time.time()) / 60)), 0)
+                text = f"监听：已定时（{start_stamp} 自动开始，还剩约 {left} 分钟）"
+            else:
+                left = max(int(round((acc.stop_at - time.time()) / 60)), 0)
+                text = (f"监听：已定时（{stop_stamp} 自动停止，还剩约 {left} 分钟；"
+                        f"当前未在监听）")
+            self.lbl_watch.configure(text=text, foreground="#1f6feb")
         else:
             self.lbl_watch.configure(text="监听：未运行", foreground="#666666")
 
@@ -802,15 +901,22 @@ class App:
                 continue
             if acc.proc and acc.proc.poll() is None:
                 state = "监听中"
-            elif acc.sched_at:
-                left = max(int(round((acc.sched_at - time.time()) / 60)), 0)
-                state = f"定时{left}分"
-            elif acc.login_ok is True:
-                state = "已登录"
-            elif acc.login_ok is False:
-                state = "未登录"
             else:
-                state = "未校验"
+                upcoming = []
+                if acc.sched_at:
+                    upcoming.append(("开", acc.sched_at))
+                if acc.stop_at:
+                    upcoming.append(("停", acc.stop_at))
+                if upcoming:
+                    kind, target = min(upcoming, key=lambda item: item[1])
+                    left = max(int(round((target - time.time()) / 60)), 0)
+                    state = f"定时{kind}{left}分"
+                elif acc.login_ok is True:
+                    state = "已登录"
+                elif acc.login_ok is False:
+                    state = "未登录"
+                else:
+                    state = "未校验"
             if self.tree.set(name, "state") != state:
                 self.tree.item(name, values=(state,))
 
