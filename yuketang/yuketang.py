@@ -35,6 +35,10 @@ ANSWER_DELAY_RANGE = (3, 5)
 IMAGE_DOWNLOAD_BUDGET = 20
 # 单张图片的总下载时长上限（秒）
 IMAGE_DOWNLOAD_TIMEOUT = 15
+# 老师在课上偶尔会临时延长答题时间，服务端下发的 limit 不一定是最新死线。
+# 在 limit 的基础上多留 30 秒再判定“答题时间已结束”，避免提前放弃；
+# 题目本身没有时限（limit=0）时不受影响。想调就改这一行。
+ANSWER_DEADLINE_GRACE = 30
 
 # 支持的大模型服务商（都是 OpenAI 兼容接口）
 AI_PROVIDERS = {
@@ -812,6 +816,8 @@ class yuketang:
         limit 是作答时限（秒；有些接口给毫秒，会按 1 小时阈值自动换算），
         0 表示没有时限。sendTime 可能是秒或毫秒，
         为 0 / 明显异常时退回本题的接收时间。
+        老师可能临时延长答题时间，所以死线按 sendTime + limit + 30 秒算，
+        多留一点缓冲；没有时限的题仍然返回 None。
         """
         if not isinstance(problem,dict):
             return None
@@ -834,7 +840,7 @@ class yuketang:
         now=time.time() if received_at is None else received_at
         if sent<=0 or sent>now+60:  # 没有 sendTime 或明显异常，按收到题目的时间算
             sent=now
-        return sent+limit
+        return sent+limit+ANSWER_DEADLINE_GRACE
 
     def _answer_expired(self,problem_id=None,deadline=None):
         """题目是否已经不能再作答（课程结束也算）。"""
