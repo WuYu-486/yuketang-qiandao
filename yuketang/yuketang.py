@@ -589,7 +589,12 @@ class yuketang:
         except Exception:
             pass
     
-    def lesson_checkin(self):
+    def lesson_checkin(self,notify_failure=True):
+        """发起签到。
+
+        notify_failure=False 时不在这里发“签到失败”消息，交给上层的
+        重试循环统一记录，避免一直重试时把历史记录刷屏。
+        """
         url="https://www.yuketang.cn/api/v3/lesson/checkin"
         headers={
             # 官方前端会把 source 一路带进 referer 和请求体，这里保持一致
@@ -608,7 +613,8 @@ class yuketang:
         # 而界面上只留下"已发起签到"一句，看不出到底签到成没成。现在明确报一句。
         if not api_ok(res):
             reason=api_reason(res)
-            self.msgmgr.sendMsg(f"签到失败：{reason}",user=self.name)
+            if notify_failure:
+                self.msgmgr.sendMsg(f"签到失败：{reason}",user=self.name)
             raise RuntimeError(f"签到失败：{reason}")
         try:
             info=res.json()['data']
@@ -617,9 +623,11 @@ class yuketang:
             if self.debug:
                 fields="、".join(sorted(str(key) for key in info.keys()))
                 print(f"[雨课堂] 签到返回字段: {fields}")
-        except Exception:
-            self.msgmgr.sendMsg("签到失败：响应里没有 lessonToken/identityId",user=self.name)
-            raise
+        except Exception as e:
+            message="签到失败：响应里没有 lessonToken/identityId"
+            if notify_failure:
+                self.msgmgr.sendMsg(message,user=self.name)
+            raise RuntimeError(message) from e
         self.msgmgr.sendMsg(f"签到成功：已进入课堂，签到方式 {self.checkin_source_desc()}",user=self.name)
 
     

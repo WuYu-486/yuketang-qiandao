@@ -52,6 +52,13 @@ NET_TARGETS = [
 # 退出码：界面靠它判断“要不要弹二维码”
 EXIT_LOGIN_EXPIRED = 3
 
+# 签到失败后的重试节奏：首次失败等 10 秒；之后每失败 6 次，间隔再加 30 秒；
+# 最长 310 秒。重试次数不设上限，直到签到成功或这节课结束。
+CHECKIN_RETRY_BASE = 10
+CHECKIN_RETRY_STEP_EVERY = 6
+CHECKIN_RETRY_STEP = 30
+CHECKIN_RETRY_MAX = 310
+
 
 # ---------------------------------------------------------------- 配置
 
@@ -293,36 +300,73 @@ def _wait_for_lesson(ykt, ykmod):
             print(f"[雨课堂] 等课中：已等 {waited // 60} 分钟，不手动关闭就一直等")
 
 
-def _wait_lesson_end(ykt, ykmod, lesson_id):
-    """签到失败时不要再反复重试签到，等这节课结束再回到等课流程"""
-    waited = 0
-    while waited < 2 * 3600:
+def _checkin_retry_delay(failures):
+    """第 failures 次签到失败后，下一次重试前要等多少秒。"""
+    steps = max(failures - 1, 0) // CHECKIN_RETRY_STEP_EVERY
+    return min(CHECKIN_RETRY_BASE + steps * CHECKIN_RETRY_STEP,
+               CHECKIN_RETRY_MAX)
+
+
+def _lesson_still_active(ykt, lesson_id):
+    """这节课是否还在进行。
+
+    查询失败时按“还在”处理：一次网络抖动不应该让重试直接放弃。
+    """
+    try:
+        return bool(ykt.getlesson()) and str(ykt.lessonId) == str(lesson_id)
+    except Exception:
+        return True
+
+
+def _checkin_with_retry(ykt, ykmod, lesson_id):
+    """签到失败就按退避节奏一直重试，直到成功或这节课结束。
+
+    重试计数是每节课独立的：签到成功、课程结束、回到等课流程，
+    或者界面停止后重新启动，都会重新从 10 秒开始。
+    """
+    failures = 0
+    while True:
         if ykt.cookie_invalid():
             raise ykmod.LoginExpired("cookie 已失效")
         try:
-            still_on = ykt.getlesson() and str(ykt.lessonId) == str(lesson_id)
-        except Exception:
-            still_on = True
-        if not still_on:
-            return
-        time.sleep(30)
-        waited += 30
-    print("[雨课堂] 这节课已经等了 2 小时，先回到等课流程")
-
-
-def _listen_forever(ykt, ykmod):
-    """等课 → 签到 → 跟课，一节接一节，直到进程被关掉"""
-    while True:
-        _wait_for_lesson(ykt, ykmod)
-        print(f"[雨课堂] 检测到课程 lessonId={ykt.lessonId}，开始签到")
-        try:
-            ykt.lesson_checkin()
+            ykt.lesson_checkin(notify_failure=False)
+            return True
         except ykmod.LoginExpired:
             raise
         except Exception as e:
-            print(f"[雨课堂] 签到失败：{type(e).__name__}: {e}")
-            print("[雨课堂] 这节课不再重复签到，等它结束后继续等下一节课 ...")
-            _wait_lesson_end(ykt, ykmod, ykt.lessonId)
+            failures += 1
+            reason = str(e).strip()
+            if reason.startswith("签到失败："):
+                reason = reason[len("签到失败："):].strip()
+            if not reason:
+                reason = type(e).__name__
+            delay = _checkin_retry_delay(failures)
+            if failures == 1:
+                # 第一次失败记进历史；之后的每次重试只打日志，避免历史被刷屏
+                ykt.msgmgr.sendMsg(
+                    f"签到失败：{reason}（{delay} 秒后自动重试，不限制次数）",
+                    user=ykt.name)
+            else:
+                print(f"[雨课堂] 签到重试第 {failures} 次失败：{reason}")
+            if not _lesson_still_active(ykt, lesson_id):
+                print("[雨课堂] 课程已结束，停止本轮签到重试")
+                return False
+            print(f"[雨课堂] {delay} 秒后重试签到"
+                  f"（第 {failures} 次失败；间隔封顶 {CHECKIN_RETRY_MAX} 秒）")
+            time.sleep(delay)
+            if not _lesson_still_active(ykt, lesson_id):
+                print("[雨课堂] 课程已结束，停止本轮签到重试")
+                return False
+
+
+def _listen_forever(ykt, ykmod):
+    """等课 → 签到（失败就退避重试）→ 跟课，一节接一节，直到进程被关掉"""
+    while True:
+        _wait_for_lesson(ykt, ykmod)
+        lesson_id = str(ykt.lessonId)
+        print(f"[雨课堂] 检测到课程 lessonId={lesson_id}，开始签到")
+        if not _checkin_with_retry(ykt, ykmod, lesson_id):
+            print("[雨课堂] 本节没有签到成功，回到等课流程 ...")
             continue
         ykt.ws_controller(ykt.ws_lesson)
         print("[雨课堂] 本节监听结束，继续等下一节课 ..."
