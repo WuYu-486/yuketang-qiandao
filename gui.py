@@ -225,7 +225,8 @@ class App:
         answer.setdefault("base_url", "")     # 留空则按 Key 来源自动选（DeepSeek / 百炼）
         answer.setdefault("model", "")        # 留空同上，例如 deepseek-chat
         answer.setdefault("send_images", True)  # 题目带图片时，把图片一起发给多模态模型
-        answer.setdefault("timeout", 60)
+        answer.setdefault("reasoning_effort", "low")  # DeepSeek 推理强度：low 更快，避免答题超时
+        answer.setdefault("timeout", 90)
         save_json(CONFIG_PATH, cfg)
         return cfg
 

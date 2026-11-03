@@ -24,6 +24,55 @@ import requests
 class AnswerTimeExpired(Exception):
     """题目作答时间已结束，不再请求大模型。"""
 
+
+class _Reply:
+    """只保留状态码和响应文本的最小响应对象。
+
+    requests 默认要等响应体全部收完才返回。有些网关在模型思考期间会隔一阵
+    子挤一点数据过来，单次 socket 读超时（timeout 的第二个数字）永远触发
+    不了，一个请求能拖好几分钟；课内题等不起这种情况。所以这里改成流式读取，
+    按总时长主动断开，再返回一个仍然带 status_code / text / json() 的对象。
+    """
+
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+# 这些异常属于网络层的临时故障，值得原样重试一次
+_RETRYABLE_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def _post_json(url, headers, payload, timeout):
+    """POST，并给“连接 + 上传 + 等响应 + 下载响应体”设一个总时长上限。"""
+    read_timeout = max(0.2, float(timeout))
+    started = time.monotonic()
+    res = requests.post(
+        url, headers=headers, json=payload,
+        timeout=(min(10.0, read_timeout), read_timeout), stream=True)
+    try:
+        chunks = []
+        for chunk in res.iter_content(64 * 1024):
+            # 先查总时长再处理数据：有的网关会一直发空 keep-alive 块，
+            # 不能因为 chunk 为空就跳过超时检查。
+            if time.monotonic() - started > read_timeout:
+                raise requests.exceptions.ReadTimeout(
+                    f"响应总时长超过 {read_timeout:.0f} 秒")
+            if chunk:
+                chunks.append(chunk)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return _Reply(res.status_code, text)
+    finally:
+        res.close()
+
+
 PROBLEM_TYPE_NAMES = {
     1: "单选题",
     2: "多选题",
@@ -196,13 +245,17 @@ def parse_json_object(text):
         return None
 
 
-def solve_problem(problem, api_key, base_url, model, timeout=30, images=None, deadline=None):
+def solve_problem(problem, api_key, base_url, model, timeout=30, images=None,
+                  deadline=None, reasoning_effort=None):
     """调用大模型生成答案。
 
     images 是图片的 data URL 列表（可为空）：带了图片就是多模态请求，
     如果模型不接受图片，会自动退回纯文字再问一次。
     deadline 是这道题的作答截止时间戳：到点后不再发起（或重试）请求，
     已经发出的请求也会按剩余时间设置超时，避免答题时间结束后继续烧 token。
+    reasoning_effort 是推理强度（DeepSeek 支持 low / high / max）。课内题
+    有作答时限，默认走 low：实测同一个带图题，high 会生成几千个推理 token、
+    单次耗时 60 秒上下；low 通常十几秒，既避免超时也省 token。
     返回 (answers, note)：
       answers 为 None 表示这次没做出答案，note 是给日志用的原因 / 说明。
     """
@@ -216,8 +269,11 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None, de
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    effort = str(reasoning_effort or "").strip().lower()
+    if effort not in ("low", "high", "max"):
+        effort = ""
 
-    def post(with_images, json_mode=True):
+    def post_once(with_images, json_mode=True):
         call_timeout = timeout
         if deadline is not None:
             remaining = deadline - time.time()
@@ -229,10 +285,28 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None, de
             "messages": build_messages(problem, with_images),
             "temperature": 0.2,
         }
+        if effort:
+            payload["reasoning_effort"] = effort
         if json_mode:
             # 让接口层强制输出 JSON，模型就没法在前后加解释
             payload["response_format"] = {"type": "json_object"}
-        return requests.post(url, headers=headers, json=payload, timeout=call_timeout)
+        return _post_json(url, headers, payload, call_timeout)
+
+    def post(with_images, json_mode=True):
+        """网络临时故障时重试一次；仍失败就交给上层记“跳过作答”。"""
+        for attempt in range(2):
+            try:
+                return post_once(with_images, json_mode)
+            except AnswerTimeExpired:
+                raise
+            except _RETRYABLE_ERRORS as e:
+                if attempt == 1:
+                    raise
+                if deadline is not None and deadline - time.time() <= 2:
+                    raise
+                print(f"[AI] 大模型请求失败（{type(e).__name__}），1 秒后重试一次")
+                time.sleep(1)
+        raise RuntimeError("大模型请求重试后仍然失败")
 
     note_suffix = ""
     try:

@@ -29,6 +29,12 @@ HEARTBEAT_INTERVAL = 300
 # 交答案前随机等待的秒数区间。大模型本身还要思考几秒，这里只留一点缓冲，
 # 等太久容易撞上题目关闭时间。想调就改这一行。
 ANSWER_DELAY_RANGE = (3, 5)
+# 题目图片下载的总预算（秒）。requests 的 timeout 只约束单次 socket 读写，
+# 图片源如果一点点吐数据，单张图能拖好几分钟，最后把大模型请求也拖到超时。
+# 超预算就少带一张图，先保证整道题能答上。
+IMAGE_DOWNLOAD_BUDGET = 20
+# 单张图片的总下载时长上限（秒）
+IMAGE_DOWNLOAD_TIMEOUT = 15
 
 # 支持的大模型服务商（都是 OpenAI 兼容接口）
 AI_PROVIDERS = {
@@ -375,6 +381,7 @@ class yuketang:
         self.answer_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
         self.answer_model=""
         self.answer_timeout=30
+        self.answer_reasoning_effort=""
         self.answer_note=""
         self.answer_key_source=""
         self.answer_send_images=True   # 题目里的图片要不要一起发给多模态模型
@@ -427,10 +434,19 @@ class yuketang:
                                    or preset.get("base_url") or DEFAULT_AI_BASE_URL).strip()
         self.answer_model = str(cfg.get("model")
                                 or preset.get("model") or DEFAULT_AI_MODEL).strip()
+        # 推理强度：DeepSeek 的 deepseek-flash 默认是 high，同一个带图题实测
+        # 能生成几千个推理 token、单次要 60 秒上下，很容易撞上超时；课内题
+        # 时间紧，所以默认降到 low。其他服务商不支持这个参数，默认不发。
+        effort = str(cfg.get("reasoning_effort") or "").strip().lower()
+        if effort not in ("low", "high", "max"):
+            effort = ""
+        if not effort and "deepseek.com" in self.answer_base_url.lower():
+            effort = "low"
+        self.answer_reasoning_effort = effort
         try:
-            self.answer_timeout = int(cfg.get("timeout") or 60)
+            self.answer_timeout = int(cfg.get("timeout") or 90)
         except (TypeError, ValueError):
-            self.answer_timeout = 60
+            self.answer_timeout = 90
         send_images = cfg.get("send_images")
         if isinstance(send_images, str):
             send_images = send_images.strip().lower() not in ("", "0", "false", "no", "off")
@@ -459,7 +475,8 @@ class yuketang:
             return "雨课堂下发的答案，拿不到就跳过作答（没有找到大模型 API Key）"
         mode = "优先雨课堂下发的答案，拿不到就用 AI" if self.answer_source == "auto" else "只用 AI"
         where = f"，Key 来自{self.answer_key_source}" if self.answer_key_source else ""
-        return f"{mode}（{self.answer_base_url} / {self.answer_model}{where}）"
+        effort = f"，推理强度={self.answer_reasoning_effort}" if self.answer_reasoning_effort else ""
+        return f"{mode}（{self.answer_base_url} / {self.answer_model}{effort}{where}）"
 
     def getcookie(self):
         if not os.path.exists(self.cookie_filename):
@@ -688,8 +705,16 @@ class yuketang:
         print(f"[雨课堂] 题目原始字段: {keys}")
         return path
 
-    def download_image(self,url,max_bytes=4*1024*1024):
-        """下载题目 / 课件里的图片，返回 data URL；失败返回空串（不影响作答）"""
+    def download_image(self,url,max_bytes=4*1024*1024,deadline=None,
+                       total_timeout=IMAGE_DOWNLOAD_TIMEOUT):
+        """下载题目 / 课件里的图片，返回 data URL；失败 / 超时返回空串。
+
+        requests 的 timeout 只约束单次 socket 读写：图片源如果隔一会儿吐一点
+        数据，单张图能拖好几分钟，最后把整道题的大模型请求也拖到超时。这里
+        改成流式下载，同时限制总时长和体积，超了就放弃这张图。
+        """
+        if deadline is not None and time.time()>=deadline:
+            return ""
         if url.startswith("//"):
             url="https:"+url
         elif url.startswith("/"):
@@ -701,41 +726,84 @@ class yuketang:
             "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
             "cookie":self.cookie
         }
+        started=time.monotonic()
         try:
-            res=requests.get(url,headers=headers,timeout=REQUEST_TIMEOUT)
+            res=requests.get(url,headers=headers,timeout=(5,10),stream=True)
         except Exception as e:
             print(f"[雨课堂] 图片下载失败：{type(e).__name__}: {e}")
             return ""
-        if res.status_code>=400 or not res.content:
-            print(f"[雨课堂] 图片下载失败：HTTP {res.status_code}")
-            return ""
-        data=res.content
-        if len(data)>max_bytes:
-            print(f"[雨课堂] 图片太大（{len(data)//1024} KB），已跳过")
-            return ""
-        mime=(res.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if not mime.startswith("image/"):
-            mime=_guess_image_mime(data)
-        return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        try:
+            if res.status_code>=400:
+                print(f"[雨课堂] 图片下载失败：HTTP {res.status_code}")
+                return ""
+            length=res.headers.get("Content-Length")
+            try:
+                if length is not None and int(length)>max_bytes:
+                    print(f"[雨课堂] 图片太大（{int(length)//1024} KB），已跳过")
+                    return ""
+            except (TypeError,ValueError):
+                pass
+            data=bytearray()
+            for chunk in res.iter_content(64*1024):
+                # 先查总时长再处理数据：空 keep-alive 块也要算进预算
+                if time.monotonic()-started>total_timeout:
+                    print(f"[雨课堂] 图片下载超时（超过 {total_timeout} 秒，"
+                          f"已下载 {len(data)//1024} KB），已跳过")
+                    return ""
+                if deadline is not None and time.time()>=deadline:
+                    print(f"[雨课堂] 图片下载预算已用完，停止下载")
+                    return ""
+                if not chunk:
+                    continue
+                data.extend(chunk)
+                if len(data)>max_bytes:
+                    print(f"[雨课堂] 图片太大（超过 {max_bytes//1024} KB），已跳过")
+                    return ""
+            if not data:
+                print(f"[雨课堂] 图片下载失败：响应为空")
+                return ""
+            mime=(res.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not mime.startswith("image/"):
+                mime=_guess_image_mime(bytes(data))
+            return f"data:{mime};base64,{base64.b64encode(bytes(data)).decode()}"
+        finally:
+            res.close()
 
     def collect_images(self,problem,problem_id,limit=3,max_bytes=4*1024*1024,deadline=None):
-        """题目会带图片时，把题干里的图片和这页课件的整页图一起准备给模型"""
+        """题目会带图片时，把题干里的图片和这页课件的整页图一起准备给模型。
+
+        整道题的图片下载共用一个时间预算：宁可少带一张图，也不能因为图片源
+        太慢把大模型请求拖到超时（11-03 早上 aa 账号的答题失败就是这么来的）。
+        """
         if not self.answer_send_images:
             return []
         urls=extract_image_urls(problem)
         cover=self.problem_covers.get(str(problem_id))
         if cover and cover not in urls:
             urls.append(cover)
+        if not urls:
+            return []
+        started=time.time()
+        download_deadline=started+IMAGE_DOWNLOAD_BUDGET
+        if deadline is not None:
+            download_deadline=min(download_deadline,deadline)
         images=[]
         for url in urls[:limit]:
             if self._answer_cancelled:
                 break
-            if deadline is not None and time.time()>=deadline:
-                print(f"[雨课堂] 答题时间已结束，停止下载题目 {problem_id} 的图片")
+            if time.time()>=download_deadline:
+                print(f"[雨课堂] 图片准备超时（超过 {IMAGE_DOWNLOAD_BUDGET} 秒），"
+                      f"题目 {problem_id} 后续图片已跳过")
                 break
-            data=self.download_image(url,max_bytes)
+            remaining=max(1.0,download_deadline-time.time())
+            data=self.download_image(url,max_bytes,deadline=download_deadline,
+                                     total_timeout=min(IMAGE_DOWNLOAD_TIMEOUT,remaining))
             if data:
                 images.append(data)
+        elapsed=time.time()-started
+        if elapsed>=2:
+            print(f"[雨课堂] 题目 {problem_id} 图片准备耗时 {elapsed:.1f} 秒"
+                  f"（{len(images)}/{len(urls[:limit])} 张）")
         return images
 
     def _compute_answer_deadline(self,problem,received_at=None):
@@ -830,13 +898,20 @@ class yuketang:
                 return
             if images:
                 print(f"[雨课堂] 题目 {problem_id} 带 {len(images)} 张图片，一起交给模型识别")
+            effort=self.answer_reasoning_effort or "默认"
+            print(f"[雨课堂] 题目 {problem_id} 请求大模型（推理强度={effort}，"
+                  f"超时={self.answer_timeout} 秒）")
+            started=time.time()
             answers,note=ai_solve_problem(problem,self.answer_api_key,self.answer_base_url,
                                           self.answer_model,self.answer_timeout,
-                                          images=images,deadline=deadline)
+                                          images=images,deadline=deadline,
+                                          reasoning_effort=self.answer_reasoning_effort)
+            elapsed=time.time()-started
+            print(f"[雨课堂] 题目 {problem_id} 大模型作答耗时 {elapsed:.1f} 秒")
             if answers is None:
-                self.answer_note=note
+                self.answer_note=f"{note}（耗时 {elapsed:.1f} 秒）"
             else:
-                source=note
+                source=f"{note}，耗时 {elapsed:.1f} 秒"
 
         if self._answer_cancelled:
             print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
