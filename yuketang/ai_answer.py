@@ -16,8 +16,13 @@ answers 字段是空的），所以本地拿不到答案时，可以把题干和
 
 import json
 import re
+import time
 
 import requests
+
+
+class AnswerTimeExpired(Exception):
+    """题目作答时间已结束，不再请求大模型。"""
 
 PROBLEM_TYPE_NAMES = {
     1: "单选题",
@@ -191,11 +196,13 @@ def parse_json_object(text):
         return None
 
 
-def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
+def solve_problem(problem, api_key, base_url, model, timeout=30, images=None, deadline=None):
     """调用大模型生成答案。
 
     images 是图片的 data URL 列表（可为空）：带了图片就是多模态请求，
     如果模型不接受图片，会自动退回纯文字再问一次。
+    deadline 是这道题的作答截止时间戳：到点后不再发起（或重试）请求，
+    已经发出的请求也会按剩余时间设置超时，避免答题时间结束后继续烧 token。
     返回 (answers, note)：
       answers 为 None 表示这次没做出答案，note 是给日志用的原因 / 说明。
     """
@@ -211,6 +218,12 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
     }
 
     def post(with_images, json_mode=True):
+        call_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise AnswerTimeExpired()
+            call_timeout = max(0.2, min(float(timeout), remaining))
         payload = {
             "model": model,
             "messages": build_messages(problem, with_images),
@@ -219,7 +232,7 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
         if json_mode:
             # 让接口层强制输出 JSON，模型就没法在前后加解释
             payload["response_format"] = {"type": "json_object"}
-        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+        return requests.post(url, headers=headers, json=payload, timeout=call_timeout)
 
     note_suffix = ""
     try:
@@ -231,7 +244,11 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None):
             # 模型 / 接口不接受图片时退回纯文字，至少别把这道题整个丢掉
             note_suffix = "，图片没被接受已按纯文字作答"
             res = post(None, json_mode=False)
+    except AnswerTimeExpired:
+        return None, "答题时间已结束"
     except Exception as e:
+        if deadline is not None and time.time() >= deadline:
+            return None, "答题时间已结束"
         return None, f"请求大模型失败：{type(e).__name__}: {e}"
 
     if res.status_code >= 400:

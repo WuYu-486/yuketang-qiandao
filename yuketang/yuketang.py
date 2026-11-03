@@ -379,6 +379,9 @@ class yuketang:
         self.answer_key_source=""
         self.answer_send_images=True   # 题目里的图片要不要一起发给多模态模型
         self._hint_ai_shown=False
+        self._problem_deadlines={}     # problemId -> 作答截止时间戳（没有时限就是 None）
+        self._answer_tasks=set()       # 正在等待/作答的题目任务，课程结束时统一取消
+        self._answer_cancelled=False   # 课程结束后不再发起新的大模型作答
 
         self.debug=True
         self.wx=False
@@ -715,7 +718,7 @@ class yuketang:
             mime=_guess_image_mime(data)
         return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
-    def collect_images(self,problem,problem_id,limit=3,max_bytes=4*1024*1024):
+    def collect_images(self,problem,problem_id,limit=3,max_bytes=4*1024*1024,deadline=None):
         """题目会带图片时，把题干里的图片和这页课件的整页图一起准备给模型"""
         if not self.answer_send_images:
             return []
@@ -725,10 +728,63 @@ class yuketang:
             urls.append(cover)
         images=[]
         for url in urls[:limit]:
+            if self._answer_cancelled:
+                break
+            if deadline is not None and time.time()>=deadline:
+                print(f"[雨课堂] 答题时间已结束，停止下载题目 {problem_id} 的图片")
+                break
             data=self.download_image(url,max_bytes)
             if data:
                 images.append(data)
         return images
+
+    def _compute_answer_deadline(self,problem,received_at=None):
+        """根据题目下发的 limit / sendTime 算作答截止时间。
+
+        limit 是作答时限（秒；有些接口给毫秒，会按 1 小时阈值自动换算），
+        0 表示没有时限。sendTime 可能是秒或毫秒，
+        为 0 / 明显异常时退回本题的接收时间。
+        """
+        if not isinstance(problem,dict):
+            return None
+        try:
+            limit=float(problem.get("limit") or 0)
+        except (TypeError,ValueError):
+            return None
+        if limit<=0:
+            return None
+        try:
+            sent=float(problem.get("sendTime") or 0)
+        except (TypeError,ValueError):
+            sent=0.0
+        send_is_ms=sent>1e12
+        if send_is_ms:
+            sent/=1000.0
+        # 有些版本给的是毫秒（如 60000 = 60 秒）；课堂随堂题一般不超过 1 小时
+        if limit>3600 or (send_is_ms and limit>=1000):
+            limit/=1000.0
+        now=time.time() if received_at is None else received_at
+        if sent<=0 or sent>now+60:  # 没有 sendTime 或明显异常，按收到题目的时间算
+            sent=now
+        return sent+limit
+
+    def _answer_expired(self,problem_id=None,deadline=None):
+        """题目是否已经不能再作答（课程结束也算）。"""
+        if self._answer_cancelled:
+            return True
+        if deadline is None and problem_id is not None:
+            deadline=self._problem_deadlines.get(str(problem_id))
+        return deadline is not None and time.time()>=deadline
+
+    def _cancel_answer_tasks(self):
+        """课程结束时取消所有还没开始（或还在等延迟）的作答任务。"""
+        self._answer_cancelled=True
+        pending=[task for task in self._answer_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        self._answer_tasks.clear()
+        if pending:
+            print(f"[雨课堂] 课程结束，取消 {len(pending)} 个未完成的答题任务")
 
     def answer(self,problem_id=None):
         problem_id=self.problemid if problem_id is None else problem_id
@@ -739,6 +795,14 @@ class yuketang:
             self.msgmgr.sendMsg(f"答题失败：本地没有题目 {problem_id} 的数据（课件可能还没同步）",user=self.name)
             return
 
+        deadline=self._problem_deadlines.get(str(problem_id))
+        if self._answer_cancelled:
+            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+            return
+        if self._answer_expired(problem_id,deadline):
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            return
+
         problem_type=int(problem.get("problemType") or 0)
         type_name=PROBLEM_TYPE_NAMES.get(problem_type,f"题型{problem_type}")
         self.answer_note=""
@@ -747,15 +811,39 @@ class yuketang:
         answers=extract_server_answers(problem)
         source="雨课堂下发"
         if answers is None and self.answer_source in ("ai","auto"):
-            images=self.collect_images(problem,problem_id)
+            if self._answer_cancelled:
+                print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+                return
+            if self._answer_expired(problem_id,deadline):
+                self.msgmgr.sendMsg(
+                    f"跳过作答：答题时间已结束，未调用大模型（题目 {problem_id}）",
+                    user=self.name)
+                return
+            images=self.collect_images(problem,problem_id,deadline=deadline)
+            if self._answer_cancelled:
+                print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+                return
+            if self._answer_expired(problem_id,deadline):
+                self.msgmgr.sendMsg(
+                    f"跳过作答：答题时间已结束，未调用大模型（题目 {problem_id}）",
+                    user=self.name)
+                return
             if images:
                 print(f"[雨课堂] 题目 {problem_id} 带 {len(images)} 张图片，一起交给模型识别")
             answers,note=ai_solve_problem(problem,self.answer_api_key,self.answer_base_url,
-                                          self.answer_model,self.answer_timeout,images=images)
+                                          self.answer_model,self.answer_timeout,
+                                          images=images,deadline=deadline)
             if answers is None:
                 self.answer_note=note
             else:
                 source=note
+
+        if self._answer_cancelled:
+            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+            return
+        if self._answer_expired(problem_id,deadline):
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            return
 
         result=normalize_result(problem,answers)
         if result is None:
@@ -873,6 +961,7 @@ class yuketang:
     async def ws_lesson(self):
         uri = "wss://www.yuketang.cn/wsapp/"
         loop=asyncio.get_event_loop()
+        self._answer_cancelled=False
         async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as websocket:
             # 发送 "hello" 消息以建立连接
             hello_message = {
@@ -918,9 +1007,22 @@ class yuketang:
                     problem=server_response.get('problem') or {}
                     if problem.get('prob'):
                         self.problemid=problem['prob']
-                        asyncio.ensure_future(self.delayed_answer(self.problemid))
+                        now=time.time()
+                        deadline=self._compute_answer_deadline(problem,now)
+                        if deadline is None:
+                            stored=self.problems.get(str(self.problemid)) or {}
+                            deadline=self._compute_answer_deadline(stored,now)
+                        self._problem_deadlines[str(self.problemid)]=deadline
+                        if deadline is not None:
+                            print(f"[雨课堂] 题目 {self.problemid} 作答时间还剩 "
+                                  f"{max(int(deadline-now),0)} 秒")
+                        task=asyncio.ensure_future(self.delayed_answer(self.problemid))
+                        self._answer_tasks.add(task)
+                        task.add_done_callback(self._answer_tasks.discard)
                 elif op=="lessonfinished":
                     self.msgmgr.sendMsg("课程结束了",user=self.name)
+                    self._cancel_answer_tasks()
+                    self._problem_deadlines.clear()
                     break
 
     async def delayed_answer(self,problem_id):
@@ -930,10 +1032,34 @@ class yuketang:
         事件循环按住，服务端心跳超时后就把连接踢掉（日志里那些
         keepalive ping timeout 就是这么来的）。改成 asyncio.sleep，
         再把阻塞的作答请求丢进线程池。
+
+        题目带作答时限（limit）时，到点后直接跳过，不再调用大模型。
         """
+        deadline=self._problem_deadlines.get(str(problem_id))
+        if self._answer_cancelled:
+            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+            return
+        if self._answer_expired(problem_id,deadline):
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            return
+
         delay=randint(*ANSWER_DELAY_RANGE)
+        # 连随机延迟都等不完就没必要开始作答了，直接跳过省 token
+        if deadline is not None and time.time()+delay>=deadline:
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            return
         print(f"[雨课堂] {delay} 秒后提交题目 {problem_id} 的答案")
-        await asyncio.sleep(delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            print(f"[雨课堂] 课程结束，取消题目 {problem_id} 的作答")
+            raise
+        if self._answer_cancelled:
+            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+            return
+        if self._answer_expired(problem_id,deadline):
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            return
         loop=asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None,self.answer,problem_id)
