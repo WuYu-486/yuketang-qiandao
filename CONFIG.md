@@ -18,8 +18,8 @@
       "base_url": "",
       "model": "",
       "send_images": true,
-      "reasoning_effort": "low",
-      "timeout": 90
+      "reasoning_effort": "high",
+      "timeout": 120
     }
   }
 }
@@ -40,8 +40,8 @@
 | `answer.api_key_env` | 指定用哪个环境变量取 Key，例如 `DEEPSEEK-API-KEY` |
 | `answer.base_url` / `answer.model` | 接口地址与模型名；留空时按 Key 来源自动选（DeepSeek 用 `https://api.deepseek.com/v1` + `deepseek-chat`） |
 | `answer.send_images` | 题目带图片时是否一起发给多模态模型，默认 `true` |
-| `answer.reasoning_effort` | 推理强度：`low` / `high` / `max`；DeepSeek 默认 `low`（更快，避免答题超时），其他服务商留空即可 |
-| `answer.timeout` | 单次调用大模型的总超时秒数，默认 `90`；题目本身有作答时限时会自动取剩余时间 |
+| `answer.reasoning_effort` | 推理强度：`low` / `high` / `max`；DeepSeek 默认 `high`（准确率优先），其他服务商留空即可 |
+| `answer.timeout` | 单次调用大模型的总超时秒数，默认 `120`；题目本身有作答时限时会自动取剩余时间 |
 
 API Key 有三种写法，任选其一：填 `answer.api_key`、放进 `DEEPSEEK-API-KEY` 之类的环境变量、或写进根目录的 `dashscope_key.txt`。找不到 Key 时课内题会跳过作答，其余功能照旧。
 

@@ -434,19 +434,19 @@ class yuketang:
                                    or preset.get("base_url") or DEFAULT_AI_BASE_URL).strip()
         self.answer_model = str(cfg.get("model")
                                 or preset.get("model") or DEFAULT_AI_MODEL).strip()
-        # 推理强度：DeepSeek 的 deepseek-flash 默认是 high，同一个带图题实测
-        # 能生成几千个推理 token、单次要 60 秒上下，很容易撞上超时；课内题
-        # 时间紧，所以默认降到 low。其他服务商不支持这个参数，默认不发。
+        # 推理强度：准确率优先，DeepSeek 默认用 high。high 遇到复杂带图题
+        # 可能生成几千个推理 token、单次要一分钟以上，所以超时要留够余量；
+        # 题目本身有作答时限时，下面会按剩余时间自动收紧。
         effort = str(cfg.get("reasoning_effort") or "").strip().lower()
         if effort not in ("low", "high", "max"):
             effort = ""
         if not effort and "deepseek.com" in self.answer_base_url.lower():
-            effort = "low"
+            effort = "high"
         self.answer_reasoning_effort = effort
         try:
-            self.answer_timeout = int(cfg.get("timeout") or 90)
+            self.answer_timeout = int(cfg.get("timeout") or 120)
         except (TypeError, ValueError):
-            self.answer_timeout = 90
+            self.answer_timeout = 120
         send_images = cfg.get("send_images")
         if isinstance(send_images, str):
             send_images = send_images.strip().lower() not in ("", "0", "false", "no", "off")

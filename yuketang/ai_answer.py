@@ -253,9 +253,9 @@ def solve_problem(problem, api_key, base_url, model, timeout=30, images=None,
     如果模型不接受图片，会自动退回纯文字再问一次。
     deadline 是这道题的作答截止时间戳：到点后不再发起（或重试）请求，
     已经发出的请求也会按剩余时间设置超时，避免答题时间结束后继续烧 token。
-    reasoning_effort 是推理强度（DeepSeek 支持 low / high / max）。课内题
-    有作答时限，默认走 low：实测同一个带图题，high 会生成几千个推理 token、
-    单次耗时 60 秒上下；low 通常十几秒，既避免超时也省 token。
+    reasoning_effort 是推理强度（DeepSeek 支持 low / high / max）。准确率
+    优先，调用方默认传 high；high 遇到复杂带图题会生成几千个推理 token、
+    单次耗时一分钟以上，所以超时要留足余量，同时用总时长上限兜底。
     返回 (answers, note)：
       answers 为 None 表示这次没做出答案，note 是给日志用的原因 / 说明。
     """

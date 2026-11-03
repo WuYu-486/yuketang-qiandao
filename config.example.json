@@ -13,8 +13,8 @@
       "base_url": "",
       "model": "",
       "send_images": true,
-      "reasoning_effort": "low",
-      "timeout": 90
+      "reasoning_effort": "high",
+      "timeout": 120
     }
   }
 }
