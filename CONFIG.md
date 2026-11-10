@@ -45,6 +45,22 @@
 
 API Key 有三种写法，任选其一：填 `answer.api_key`、放进 `DEEPSEEK-API-KEY` 之类的环境变量、或写进根目录的 `dashscope_key.txt`。找不到 Key 时课内题会跳过作答，其余功能照旧。
 
+## 账号级 AI 开关
+
+除了全局的 `answer.source`，每个账号还有一个独立的 AI 作答开关，保存在 `accounts.json` 的 `ai_answer` 里，例如：
+
+```json
+{
+  "accounts": ["me", "aa"],
+  "ai_answer": {"me": true, "aa": false}
+}
+```
+
+- 图形界面里选中账号，勾选/取消顶部的「AI 作答」即可，会自动写回 `accounts.json`。
+- 关闭后该账号只使用雨课堂下发的答案，拿不到就跳过，不会调用大模型。
+- 正在监听的账号切换开关后，下一道题开始生效，不需要停止再重新开始。
+- 老版本 `accounts.json` 没有 `ai_answer` 字段时默认开启，保持原来的行为。
+
 ## 签到方式
 
 签到方式由签到请求里的 `source` 决定：官方前端会把它从页面 URL 的 `?source=` 读出来，再放进请求体。雨课堂没有公开这个枚举，下面的对照来自社区整理，仅供参考：

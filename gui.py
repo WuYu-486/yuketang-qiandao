@@ -185,6 +185,7 @@ class Account:
         self.lesson = None
         self.sched_at = None      # 定时开始监听的时间戳（每个账号独立）
         self.stop_at = None       # 定时停止监听的时间戳（每个账号独立）
+        self.ai_enabled = True    # 该账号是否允许调用 AI 作答（每个账号独立）
 
 
 class App:
@@ -253,12 +254,14 @@ class App:
         left.pack_propagate(False)
 
         ttk.Label(left, text="账号列表", font=FONT_B).pack(anchor="w")
-        self.tree = ttk.Treeview(left, columns=("state",), show="tree headings",
+        self.tree = ttk.Treeview(left, columns=("state", "ai"), show="tree headings",
                                  height=14, selectmode="browse")
         self.tree.heading("#0", text="账号")
         self.tree.heading("state", text="状态")
-        self.tree.column("#0", width=110, anchor="w")
-        self.tree.column("state", width=90, anchor="w")
+        self.tree.heading("ai", text="AI")
+        self.tree.column("#0", width=100, anchor="w")
+        self.tree.column("state", width=78, anchor="w")
+        self.tree.column("ai", width=34, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=(4, 6))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
@@ -280,6 +283,10 @@ class App:
         self.lbl_login.grid(row=0, column=1, sticky="w", padx=(0, 20))
         self.lbl_watch = ttk.Label(card, text="监听：未运行", font=FONT)
         self.lbl_watch.grid(row=0, column=2, sticky="w", padx=(0, 20))
+        self.ai_var = tk.BooleanVar(value=True)
+        self.chk_ai = ttk.Checkbutton(card, text="AI 作答", variable=self.ai_var,
+                                      command=self._toggle_ai)
+        self.chk_ai.grid(row=0, column=3, sticky="e")
         self.lbl_lesson = ttk.Label(card, text="课程：-", font=FONT_SM)
         self.lbl_lesson.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         for col in range(4):
@@ -369,6 +376,17 @@ class App:
                 continue
             if value > now:
                 acc.stop_at = float(value)
+        # 每个账号的 AI 作答开关；老版本没有这个字段时默认开启
+        ai_flags = data.get("ai_answer")
+        if isinstance(ai_flags, dict):
+            for name, value in ai_flags.items():
+                acc = self.accounts.get(name)
+                if acc is None:
+                    continue
+                if isinstance(value, str):
+                    acc.ai_enabled = value.strip().lower() not in ("", "0", "false", "no", "off")
+                else:
+                    acc.ai_enabled = bool(value)
         self._refresh_tree()
         last = data.get("last")
         self._select(last if last in self.accounts else names[0])
@@ -378,16 +396,20 @@ class App:
                      for name, acc in self.accounts.items() if acc.sched_at}
         stops = {name: int(acc.stop_at)
                  for name, acc in self.accounts.items() if acc.stop_at}
+        ai_answer = {name: bool(acc.ai_enabled)
+                     for name, acc in self.accounts.items()}
         save_json(ACCOUNTS_PATH, {"accounts": list(self.accounts),
                                   "last": self._selected_name(),
                                   "schedules": schedules,
-                                  "stops": stops})
+                                  "stops": stops,
+                                  "ai_answer": ai_answer})
 
     def _new_account(self, name, select=True):
         acc = Account(name)
         self.accounts[name] = acc
         if not self.tree.exists(name):
-            self.tree.insert("", "end", iid=name, text=name, values=("未校验",))
+            self.tree.insert("", "end", iid=name, text=name,
+                             values=("未校验", "开" if acc.ai_enabled else "关"))
         if select:
             self._select(name)
         return acc
@@ -408,6 +430,21 @@ class App:
             self._render_account(name)
             self._save_accounts()
 
+    def _toggle_ai(self):
+        """切换当前账号的 AI 作答开关；每个账号独立保存。"""
+        name = self._selected_name()
+        acc = self.accounts.get(name) if name else None
+        if acc is None:
+            return
+        acc.ai_enabled = bool(self.ai_var.get())
+        self._save_accounts()
+        self._refresh_tree()
+        state = "开启" if acc.ai_enabled else "关闭"
+        msg = f"AI 作答已{state}（正在监听时下一道题生效）"
+        self._append_log(name, f"==== {msg} ====")
+        self._record(name, msg)
+        self._set_status(f"{name}：{msg}")
+
     def _render_account(self, name):
         """把选中账号的数据铺到面板上，并顺手校验一次登录状态"""
         acc = self.accounts.get(name)
@@ -415,6 +452,8 @@ class App:
             return
         self.lbl_account.configure(text=f"账号：{name}")
         self._update_card(acc)
+        self.ai_var.set(bool(acc.ai_enabled))
+        self.chk_ai.configure(state="normal")
 
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
@@ -442,6 +481,8 @@ class App:
         self.lbl_qr_hint.configure(text="")
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="disabled")
+        self.ai_var.set(True)
+        self.chk_ai.configure(state="disabled")
 
     def _add_account(self):
         name = simpledialog.askstring(
@@ -919,8 +960,10 @@ class App:
                     state = "未登录"
                 else:
                     state = "未校验"
-            if self.tree.set(name, "state") != state:
-                self.tree.item(name, values=(state,))
+            ai_state = "开" if acc.ai_enabled else "关"
+            if (self.tree.set(name, "state") != state
+                    or self.tree.set(name, "ai") != ai_state):
+                self.tree.item(name, values=(state, ai_state))
 
     # -------------------------------------------------------- 二维码 / 登录状态
 

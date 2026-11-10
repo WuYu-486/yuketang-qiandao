@@ -23,6 +23,7 @@ import traceback
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
+ACCOUNTS_PATH = os.path.join(ROOT, "accounts.json")
 
 _YKT_DIR = os.path.join(ROOT, "yuketang")
 if os.path.isdir(_YKT_DIR) and _YKT_DIR not in sys.path:
@@ -70,6 +71,26 @@ def deep_merge(base, override):
         else:
             out[key] = value
     return out
+
+
+def load_account_ai_enabled(name, default=True):
+    """读取该账号的 AI 作答开关。
+
+    开关存在 accounts.json 的 ai_answer 里，界面每个账号一个；
+    没有记录（老版本 accounts.json）或读不到文件时保持原来的行为（开启）。
+    """
+    try:
+        with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return default
+    flags = data.get("ai_answer") if isinstance(data, dict) else None
+    if not isinstance(flags, dict) or name not in flags:
+        return default
+    value = flags[name]
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
 
 
 def load_config():
@@ -397,6 +418,12 @@ def cmd_ykt(cfg, name=None):
     ykt.msgmgr.wx = wx
     ykt.lesson_filter = (cfg_ykt.get("lesson_filter") or "").strip()
     ykt.configure_answer(cfg_ykt.get("answer") or {})
+    ykt.set_ai_enabled(load_account_ai_enabled(name))
+    # 每道题开始前重新读 accounts.json：界面里切换开关后，正在监听的
+    # 账号从下一道题开始生效，不需要停掉重开。读文件失败时沿用上一次的值，
+    # 避免刚好撞上界面原子替换文件的瞬间把 AI 误打开。
+    ykt.answer_ai_enabled_getter = lambda: load_account_ai_enabled(
+        name, default=ykt.answer_ai_enabled)
     ykt.configure_checkin(cfg_ykt.get("checkin_source"))
 
     print("[雨课堂] 等待有课进行中（每 30 秒查一次，不会自动退出）...")

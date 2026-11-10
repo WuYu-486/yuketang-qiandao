@@ -385,6 +385,8 @@ class yuketang:
         self.answer_note=""
         self.answer_key_source=""
         self.answer_send_images=True   # 题目里的图片要不要一起发给多模态模型
+        self.answer_ai_enabled=True    # 该账号的 AI 作答开关（每个账号独立）
+        self.answer_ai_enabled_getter=None  # run.py 设置：每道题前重新读一次账号开关
         self._hint_ai_shown=False
         self._problem_deadlines={}     # problemId -> 作答截止时间戳（没有时限就是 None）
         self._answer_tasks=set()       # 正在等待/作答的题目任务，课程结束时统一取消
@@ -467,10 +469,17 @@ class yuketang:
         name = CHECKIN_SOURCE_NAMES.get(self.checkin_source, "未知来源")
         return f"source={self.checkin_source}（{name}）"
 
+    def set_ai_enabled(self, enabled):
+        """设置该账号是否允许调用大模型；每个账号独立。"""
+        self.answer_ai_enabled = bool(enabled)
+        return self.answer_ai_enabled
+
     def answer_source_desc(self):
         """给日志用的一句话说明，告诉用户答题答案是从哪来的"""
         if self.answer_source == "server":
             return "只使用雨课堂下发的答案（拿不到就跳过作答）"
+        if not self.answer_ai_enabled:
+            return "该账号未开启 AI 作答（只用雨课堂下发的答案）"
         if not self.answer_api_key:
             return "雨课堂下发的答案，拿不到就跳过作答（没有找到大模型 API Key）"
         mode = "优先雨课堂下发的答案，拿不到就用 AI" if self.answer_source == "auto" else "只用 AI"
@@ -884,10 +893,15 @@ class yuketang:
         type_name=PROBLEM_TYPE_NAMES.get(problem_type,f"题型{problem_type}")
         self.answer_note=""
 
-        # 先看雨课堂有没有下发答案；没有就按配置决定要不要交给大模型
+        # 每道题开始前重新读一次该账号的 AI 开关：界面里切换后，
+        # 已经在监听的账号从下一道题开始生效，不用停掉重开。
+        if self.answer_ai_enabled_getter is not None:
+            self.answer_ai_enabled = bool(self.answer_ai_enabled_getter())
+
+        # 先看雨课堂有没有下发答案；没有就按配置 + 该账号 AI 开关决定要不要交给大模型
         answers=extract_server_answers(problem)
         source="雨课堂下发"
-        if answers is None and self.answer_source in ("ai","auto"):
+        if answers is None and self.answer_source in ("ai","auto") and self.answer_ai_enabled:
             if self._answer_cancelled:
                 print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
                 return
@@ -934,7 +948,10 @@ class yuketang:
             # 关键修复：拿不到有效答案就明确说“跳过作答”，
             # 不再把空答案当成作答成功提交上去。
             if answers is None:
-                reason=self.answer_note or "雨课堂没有下发这道题的答案"
+                if not self.answer_ai_enabled and self.answer_source in ("ai","auto"):
+                    reason="该账号未开启 AI 作答，且雨课堂没有下发答案"
+                else:
+                    reason=self.answer_note or "雨课堂没有下发这道题的答案"
                 extra=""
             else:
                 # 把模型原样给的答案也记下来，方便回头查是哪一步对不上
@@ -945,7 +962,8 @@ class yuketang:
             if saved:
                 detail+=f"，原始数据已存 {os.path.basename(saved)}"
             self.msgmgr.sendMsg(f"跳过作答：{reason}（{detail}）",user=self.name)
-            if not self.answer_api_key and self.answer_source in ("ai","auto") and not self._hint_ai_shown:
+            if (not self.answer_api_key and self.answer_source in ("ai","auto")
+                    and self.answer_ai_enabled and not self._hint_ai_shown):
                 self._hint_ai_shown=True
                 self.msgmgr.sendMsg(
                     "提示：雨课堂已不再下发课内题答案，想自动作答请在 config.json 的 "
