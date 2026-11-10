@@ -7,7 +7,6 @@ import os
 import time
 import traceback
 from util import *
-from random import*
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,9 +25,6 @@ REQUEST_TIMEOUT = 15
 # 课内监听的心跳间隔（秒）：这么久没收到任何服务端事件就打印一行心跳，
 # 让界面和日志知道进程还活着。
 HEARTBEAT_INTERVAL = 300
-# 交答案前随机等待的秒数区间。大模型本身还要思考几秒，这里只留一点缓冲，
-# 等太久容易撞上题目关闭时间。想调就改这一行。
-ANSWER_DELAY_RANGE = (3, 5)
 # 题目图片下载的总预算（秒）。requests 的 timeout 只约束单次 socket 读写，
 # 图片源如果一点点吐数据，单张图能拖好几分钟，最后把大模型请求也拖到超时。
 # 超预算就少带一张图，先保证整道题能答上。
@@ -866,6 +862,13 @@ class yuketang:
         # 原来会抛 KeyError 把整个监听打断，现在记一笔明确的失败。
         problem=self.problems.get(str(problem_id))
         if problem is None:
+            # 收到题就立即作答时，课件数据可能还差一拍没同步过来；先补拉一次。
+            try:
+                self.fetch_presentation()
+            except Exception as e:
+                print(f"[雨课堂] 题目数据缺失，补拉课件失败：{type(e).__name__}: {e}")
+            problem=self.problems.get(str(problem_id))
+        if problem is None:
             self.msgmgr.sendMsg(f"答题失败：本地没有题目 {problem_id} 的数据（课件可能还没同步）",user=self.name)
             return
 
@@ -1097,7 +1100,7 @@ class yuketang:
                         if deadline is not None:
                             print(f"[雨课堂] 题目 {self.problemid} 作答时间还剩 "
                                   f"{max(int(deadline-now),0)} 秒")
-                        task=asyncio.ensure_future(self.delayed_answer(self.problemid))
+                        task=asyncio.ensure_future(self.answer_immediately(self.problemid))
                         self._answer_tasks.add(task)
                         task.add_done_callback(self._answer_tasks.discard)
                 elif op=="lessonfinished":
@@ -1106,14 +1109,11 @@ class yuketang:
                     self._problem_deadlines.clear()
                     break
 
-    async def delayed_answer(self,problem_id):
-        """等一小会儿再提交答案。
+    async def answer_immediately(self,problem_id):
+        """收到题目后立即开始作答。
 
-        上游原本用阻塞式 time.sleep 等这段延迟：同步阻塞会把整个 websocket
-        事件循环按住，服务端心跳超时后就把连接踢掉（日志里那些
-        keepalive ping timeout 就是这么来的）。改成 asyncio.sleep，
-        再把阻塞的作答请求丢进线程池。
-
+        原来这里会随机等 3–5 秒再调用模型；现在去掉这段等待，收到
+        unlockproblem 就马上把作答丢进线程池，尽量给模型多留时间。
         题目带作答时限（limit）时，到点后直接跳过，不再调用大模型。
         """
         deadline=self._problem_deadlines.get(str(problem_id))
@@ -1124,26 +1124,13 @@ class yuketang:
             self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
             return
 
-        delay=randint(*ANSWER_DELAY_RANGE)
-        # 连随机延迟都等不完就没必要开始作答了，直接跳过省 token
-        if deadline is not None and time.time()+delay>=deadline:
-            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
-            return
-        print(f"[雨课堂] {delay} 秒后提交题目 {problem_id} 的答案")
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            print(f"[雨课堂] 课程结束，取消题目 {problem_id} 的作答")
-            raise
-        if self._answer_cancelled:
-            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
-            return
-        if self._answer_expired(problem_id,deadline):
-            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
-            return
+        print(f"[雨课堂] 收到题目 {problem_id}，立即开始作答")
         loop=asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None,self.answer,problem_id)
+        except asyncio.CancelledError:
+            print(f"[雨课堂] 课程结束，取消题目 {problem_id} 的作答")
+            raise
         except Exception:
             traceback.print_exc()
 
