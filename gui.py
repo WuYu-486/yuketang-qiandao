@@ -227,6 +227,7 @@ class App:
         answer.setdefault("model", "")        # 留空同上，例如 deepseek-chat
         answer.setdefault("send_images", True)  # 题目带图片时，把图片一起发给多模态模型
         answer.setdefault("reasoning_effort", "high")  # DeepSeek 推理强度：high 保证准确率
+        answer.setdefault("share_answers", True)  # 同一堂课同一道题，多个账号共享一次 AI 结果
         answer.setdefault("timeout", 120)
         save_json(CONFIG_PATH, cfg)
         return cfg

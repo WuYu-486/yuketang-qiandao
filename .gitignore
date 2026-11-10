@@ -17,3 +17,5 @@ debug_problem_*.json
 debug_lessons_*.json
 # 可选：AI 作答用的 API Key
 dashscope_key.txt
+# 跨账号共享 AI 答案的本地缓存（含题目/答案，不要提交）
+answer_cache.sqlite3*

@@ -16,6 +16,10 @@ try:
     from ai_answer import solve_problem as ai_solve_problem, extract_image_urls
 except ImportError:          # 万一以包的形式被导入
     from yuketang.ai_answer import solve_problem as ai_solve_problem, extract_image_urls
+try:
+    from answer_share import AnswerShareCache
+except ImportError:
+    from yuketang.answer_share import AnswerShareCache
 
 # 异常重试间隔（秒）。上游靠 start_time<6000 兜底退出，改成常驻监听后
 # 必须自己限速，否则登录态失效或断网时会变成不间隔的死循环猛刷服务端。
@@ -408,6 +412,8 @@ class yuketang:
         self.answer_send_images=True   # 题目里的图片要不要一起发给多模态模型
         self.answer_ai_enabled=True    # 该账号的 AI 作答开关（每个账号独立）
         self.answer_ai_enabled_getter=None  # run.py 设置：每道题前重新读一次账号开关
+        self.answer_share_enabled=True # 是否允许跨账号共享同一道题的 AI 结果
+        self.answer_share_cache=None   # answer_share.AnswerShareCache，configure_answer 里创建
         self._hint_ai_shown=False
         self._problem_deadlines={}     # problemId -> 作答截止时间戳（没有时限就是 None）
         self._problem_deadline_extended=set()  # 已经处理过 extendtime 的 pid（死线里不再含 +30）
@@ -483,6 +489,20 @@ class yuketang:
         if isinstance(send_images, str):
             send_images = send_images.strip().lower() not in ("", "0", "false", "no", "off")
         self.answer_send_images = True if send_images is None else bool(send_images)
+
+        # 跨账号共享同一道题的 AI 结果：默认开启；初始化失败就回退为各答各的
+        share = cfg.get("share_answers")
+        if isinstance(share, str):
+            share = share.strip().lower() not in ("", "0", "false", "no", "off")
+        self.answer_share_enabled = True if share is None else bool(share)
+        self.answer_share_cache = None
+        if self.answer_share_enabled:
+            try:
+                self.answer_share_cache = AnswerShareCache()
+            except Exception as e:
+                print(f"[AI共享] 共享缓存初始化失败，本次改为各账号独立作答："
+                      f"{type(e).__name__}: {e}")
+                self.answer_share_enabled = False
 
     def configure_checkin(self, source=None):
         """设置签到用的 source，决定雨课堂把这条考勤记成哪种“签到方式”"""
@@ -1126,6 +1146,104 @@ class yuketang:
             with self._answer_state_lock:
                 self._answer_submitting.discard(pid)
 
+    def _share_variant(self):
+        return (f"{self.answer_base_url}|{self.answer_model}|"
+                f"{self.answer_reasoning_effort}")
+
+    def _share_wait_budget(self,deadline):
+        if deadline is None:
+            return max(1.0,self.answer_timeout+30)
+        return deadline-time.time()-0.5
+
+    def _answer_with_share(self,problem_id,problem,deadline,compute_ai):
+        """先查共享缓存；没有就抢 leader 计算，其他账号等待结果。
+
+        返回 (answers, source)。只有 leader 会执行 compute_ai，等待方不会重复
+        调用大模型；租约失效后才会由下一个账号接管。
+        """
+        cache=self.answer_share_cache
+        if cache is None:
+            return compute_ai()
+        pid=str(problem_id)
+        key=cache.make_key(self.lessonId,pid,problem,self._share_variant())
+        owner=f"{self.name}:{os.getpid()}:{time.time_ns()}"
+        problem_type=int(problem.get("problemType") or 0)
+        for _ in range(4):
+            if self._answer_cancelled:
+                return None,"课程结束"
+            try:
+                status,payload=cache.acquire(key,owner)
+            except Exception as e:
+                print(f"[AI共享] 缓存异常，本次改为独立作答："
+                      f"{type(e).__name__}: {e}")
+                return compute_ai()
+            if status=="hit":
+                print(f"[AI共享] 题目 {pid} 命中共享答案，跳过 AI 调用")
+                return (payload["result"],
+                        f"{payload['source']}（AI 共享缓存）")
+            if status=="leader":
+                print(f"[AI共享] 题目 {pid} 由本账号负责计算，其他账号等待")
+                lease=payload
+                try:
+                    answers,source=compute_ai()
+                    if answers is None:
+                        lease.fail(source or "AI 未返回答案")
+                        return None,source or "AI 共享计算未得到答案"
+                    result=normalize_result(problem,answers)
+                    if result is None:
+                        lease.fail("答案无法解析")
+                        return None,"AI 共享计算未得到有效答案"
+                    try:
+                        published=lease.publish(result,source,problem_type)
+                    except Exception as e:
+                        published=False
+                        print(f"[AI共享] 题目 {pid} 发布结果异常："
+                              f"{type(e).__name__}: {e}")
+                        try:
+                            lease.fail(f"发布失败：{type(e).__name__}: {e}")
+                        except Exception:
+                            pass
+                    if not published:
+                        print(f"[AI共享] 题目 {pid} 结果未写入共享缓存，"
+                              f"本账号仍使用本机结果")
+                    return result,f"{source}（AI 共享）"
+                except Exception as e:
+                    lease.fail(f"{type(e).__name__}: {e}")
+                    print(f"[AI共享] 题目 {pid} 计算失败：{type(e).__name__}: {e}")
+                    return None,"AI 共享计算失败"
+            if status=="wait":
+                budget=self._share_wait_budget(self._current_deadline(pid))
+                if budget<=0:
+                    return None,"等待共享答案时答题时间已结束"
+                print(f"[AI共享] 题目 {pid} 等待其他账号的 AI 结果"
+                      f"（最多 {budget:.0f} 秒）")
+                while True:
+                    # 用短时间片等待，期间如果收到 extendtime，死线会变长，
+                    # 下一轮重新计算预算，不会按旧死线提前放弃。
+                    budget=self._share_wait_budget(self._current_deadline(pid))
+                    if budget<=0:
+                        return None,"等待共享答案时答题时间已结束"
+                    try:
+                        status2,payload2=cache.wait(
+                            key,min(1.0,budget),
+                            should_stop=lambda: self._answer_cancelled)
+                    except Exception as e:
+                        print(f"[AI共享] 等待缓存异常：{type(e).__name__}: {e}")
+                        return None,"等待共享答案失败（未重复调用模型）"
+                    if status2=="hit":
+                        return (payload2["result"],
+                                f"{payload2['source']}（AI 共享缓存）")
+                    if status2=="retry":
+                        break
+                    if status2=="stopped":
+                        return None,"课程结束"
+                    if status2=="failed":
+                        return None,"AI 共享计算失败，未重复调用模型"
+                    # timeout：可能只是这一秒没结果，重新读死线后再等
+                continue
+            return None,"AI 共享计算失败，未重复调用模型"
+        return None,"AI 共享重试次数已用完"
+
     def answer(self,problem_id=None):
         problem_id=self.problemid if problem_id is None else problem_id
         pid=str(problem_id)
@@ -1164,29 +1282,19 @@ class yuketang:
         if self.answer_ai_enabled_getter is not None:
             self.answer_ai_enabled = bool(self.answer_ai_enabled_getter())
 
-        # 先看雨课堂有没有下发答案；没有就按配置 + 该账号 AI 开关决定要不要交给大模型
-        answers=extract_server_answers(problem)
-        source="雨课堂下发"
-        if answers is None and self.answer_source in ("ai","auto") and self.answer_ai_enabled:
+        def compute_ai():
+            """真正调用大模型；共享缓存 leader 或未开启共享时才会执行。"""
             if self._answer_cancelled:
-                print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
-                return
+                return None,"课程结束"
             deadline=self._current_deadline(pid)
             if self._answer_expired(pid,deadline):
-                self.msgmgr.sendMsg(
-                    f"跳过作答：答题时间已结束，未调用大模型（题目 {pid}）",
-                    user=self.name)
-                return
+                return None,"答题时间已结束"
             images=self.collect_images(problem,pid,deadline=deadline)
             if self._answer_cancelled:
-                print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
-                return
+                return None,"课程结束"
             deadline=self._current_deadline(pid)
             if self._answer_expired(pid,deadline):
-                self.msgmgr.sendMsg(
-                    f"跳过作答：答题时间已结束，未调用大模型（题目 {pid}）",
-                    user=self.name)
-                return
+                return None,"答题时间已结束"
             if images:
                 print(f"[雨课堂] 题目 {pid} 带 {len(images)} 张图片，一起交给模型识别")
             effort=self.answer_reasoning_effort or "默认"
@@ -1196,16 +1304,30 @@ class yuketang:
             print(f"[雨课堂] 题目 {pid} 请求大模型（推理强度={effort}，"
                   f"超时={self.answer_timeout} 秒）")
             started=time.time()
-            answers,note=ai_solve_problem(problem,self.answer_api_key,self.answer_base_url,
-                                          self.answer_model,self.answer_timeout,
-                                          images=images,deadline=ai_deadline,
-                                          reasoning_effort=self.answer_reasoning_effort)
+            model_answers,note=ai_solve_problem(
+                problem,self.answer_api_key,self.answer_base_url,
+                self.answer_model,self.answer_timeout,
+                images=images,deadline=ai_deadline,
+                reasoning_effort=self.answer_reasoning_effort)
             elapsed=time.time()-started
             print(f"[雨课堂] 题目 {pid} 大模型作答耗时 {elapsed:.1f} 秒")
-            if answers is None:
+            if model_answers is None:
                 self.answer_note=f"{note}（耗时 {elapsed:.1f} 秒）"
+                return None,self.answer_note
+            return model_answers,f"{note}，耗时 {elapsed:.1f} 秒"
+
+        # 先看雨课堂有没有下发答案；没有就按配置 + 该账号 AI 开关决定要不要交给大模型
+        answers=extract_server_answers(problem)
+        source="雨课堂下发"
+        if answers is None and self.answer_source in ("ai","auto") and self.answer_ai_enabled:
+            if self.answer_share_enabled and self.answer_share_cache is not None:
+                answers,source=self._answer_with_share(pid,problem,deadline,compute_ai)
+                if answers is None:
+                    self.answer_note=source
             else:
-                source=f"{note}，耗时 {elapsed:.1f} 秒"
+                answers,source=compute_ai()
+                if answers is None:
+                    self.answer_note=source
 
         if self._answer_cancelled:
             print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")

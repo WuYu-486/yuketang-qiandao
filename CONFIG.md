@@ -19,6 +19,7 @@
       "model": "",
       "send_images": true,
       "reasoning_effort": "high",
+      "share_answers": true,
       "timeout": 120
     }
   }
@@ -41,6 +42,7 @@
 | `answer.base_url` / `answer.model` | 接口地址与模型名；留空时按 Key 来源自动选（DeepSeek 用 `https://api.deepseek.com/v1` + `deepseek-chat`） |
 | `answer.send_images` | 题目带图片时是否一起发给多模态模型，默认 `true` |
 | `answer.reasoning_effort` | 推理强度：`low` / `high` / `max`；DeepSeek 默认 `high`（准确率优先），其他服务商留空即可 |
+| `answer.share_answers` | 是否允许同一堂课、同一道题只调用一次 AI，多个账号共享结果；默认 `true`，关闭后各账号独立作答 |
 | `answer.timeout` | 单次调用大模型的总超时秒数，默认 `120`；题目本身有作答时限时会自动取剩余时间 |
 
 API Key 有三种写法，任选其一：填 `answer.api_key`、放进 `DEEPSEEK-API-KEY` 之类的环境变量、或写进根目录的 `dashscope_key.txt`。找不到 Key 时课内题会跳过作答，其余功能照旧。
@@ -60,6 +62,17 @@ API Key 有三种写法，任选其一：填 `answer.api_key`、放进 `DEEPSEEK
 - 关闭后该账号只使用雨课堂下发的答案，拿不到就跳过，不会调用大模型。
 - 正在监听的账号切换开关后，下一道题开始生效，不需要停止再重新开始。
 - 老版本 `accounts.json` 没有 `ai_answer` 字段时默认开启，保持原来的行为。
+
+## AI 答案共享
+
+`answer.share_answers` 默认开启。多个账号同时监听同一堂课、遇到同一道题时，只会有一个账号真正调用大模型，其他账号等待并复用结果，然后各自提交答案。
+
+- 识别方式：`lessonId + problemId + 题目内容指纹 + 模型/推理强度`，自动完成，不需要配置班级或账号关系。
+- 共享缓存保存在项目根目录的 `answer_cache.sqlite3`，不会提交到 git，默认保留 24 小时。
+- 抢到计算权的进程持有 SQLite 租约并定时续期；其他进程只等待，不会重复调用 AI。计算进程退出或租约过期后，下一个账号才会接管。
+- 提交答案仍然是每个账号各发一次；`LESSON_PROBLEM_FINISHED` 重试、`extendtime` 延长等逻辑不受影响。
+- 如果某个账号的「AI 作答」开关关闭，它既不使用共享 AI 答案，也不参与共享计算。
+- 想完全回到各账号独立作答，把 `share_answers` 改成 `false`。
 
 ## 签到方式
 

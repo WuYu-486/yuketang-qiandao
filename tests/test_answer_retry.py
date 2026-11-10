@@ -60,6 +60,8 @@ def make_obj():
     obj.answer_source = "auto"
     obj.answer_ai_enabled = True
     obj.answer_ai_enabled_getter = None
+    obj.answer_share_enabled = False
+    obj.answer_share_cache = None
     obj.answer_api_key = "key"
     obj.answer_base_url = "https://api.deepseek.com/v1"
     obj.answer_model = "deepseek-flash"
