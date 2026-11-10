@@ -4,6 +4,7 @@ import websockets
 import json
 import requests
 import os
+import threading
 import time
 import traceback
 from util import *
@@ -35,6 +36,16 @@ IMAGE_DOWNLOAD_TIMEOUT = 15
 # 在 limit 的基础上多留 30 秒再判定“答题时间已结束”，避免提前放弃；
 # 题目本身没有时限（limit=0）时不受影响。想调就改这一行。
 ANSWER_DEADLINE_GRACE = 30
+# 已经发给大模型的请求，如果死线到了还没返回，最多再给它 30 秒收尾：
+# 老师可能刚好在这时延长答题时间。注意这只影响已经发出的请求，死线后
+# 不会新发起 AI 调用。
+ANSWER_INFLIGHT_GRACE = 30
+# 提交答案遇到“题目已结束”时的重试节奏：首次 + 2 次重试，间隔 5 秒。
+ANSWER_SUBMIT_RETRY_DELAY = 5
+ANSWER_SUBMIT_MAX_ATTEMPTS = 3
+# 雨课堂答案接口的两种典型返回，日志里实际出现过
+LESSON_PROBLEM_FINISHED = "LESSON_PROBLEM_FINISHED"
+LESSON_PROBLEM_ALREADY_ANSWERED = "LESSON_PROBLEM_ALREADY_ANSWERED"
 
 # 支持的大模型服务商（都是 OpenAI 兼容接口）
 AI_PROVIDERS = {
@@ -357,6 +368,16 @@ def api_reason(res):
     return f"HTTP {res.status_code}"
 
 
+def answer_error_kind(res):
+    """把答案接口的失败归类：finished=题目已结束，already=已经作答过。"""
+    reason = api_reason(res)
+    if LESSON_PROBLEM_FINISHED in reason:
+        return "finished"
+    if LESSON_PROBLEM_ALREADY_ANSWERED in reason:
+        return "already"
+    return "other"
+
+
 class yuketang:
     def __init__(self,name) -> None:
         self.name=name
@@ -389,8 +410,17 @@ class yuketang:
         self.answer_ai_enabled_getter=None  # run.py 设置：每道题前重新读一次账号开关
         self._hint_ai_shown=False
         self._problem_deadlines={}     # problemId -> 作答截止时间戳（没有时限就是 None）
+        self._problem_deadline_extended=set()  # 已经处理过 extendtime 的 pid（死线里不再含 +30）
         self._answer_tasks=set()       # 正在等待/作答的题目任务，课程结束时统一取消
         self._answer_cancelled=False   # 课程结束后不再发起新的大模型作答
+        # 每道题的答案缓存 / 提交状态：用于“提交时题目刚好关闭、随后老师延长”时重发
+        self._answer_results={}        # pid -> {result, problem_type, type_name, source, dropped}
+        self._answer_running=set()     # 正在调用 AI 的 pid
+        self._answer_submitted=set()   # 已经成功提交（或服务端提示已作答过）的 pid
+        self._answer_submitting=set()  # 正在走提交重试循环的 pid
+        self._answer_retry_events={}   # pid -> threading.Event，延长事件用来叫醒重试
+        self._reopen_answer_attempts=set()  # 每道题因重新开放补跑 AI 的次数限制
+        self._answer_state_lock=threading.Lock()
 
         self.debug=True
         self.wx=False
@@ -856,8 +886,13 @@ class yuketang:
         return deadline is not None and time.time()>=deadline
 
     def _cancel_answer_tasks(self):
-        """课程结束时取消所有还没开始（或还在等延迟）的作答任务。"""
+        """课程结束时取消所有还没开始（或还在等重试）的作答任务。"""
         self._answer_cancelled=True
+        # 叫醒正在 5 秒等待里的提交重试，让它看到取消标记后退出
+        with self._answer_state_lock:
+            events=list(self._answer_retry_events.values())
+        for event in events:
+            event.set()
         pending=[task for task in self._answer_tasks if not task.done()]
         for task in pending:
             task.cancel()
@@ -865,28 +900,259 @@ class yuketang:
         if pending:
             print(f"[雨课堂] 课程结束，取消 {len(pending)} 个未完成的答题任务")
 
+    def _reset_answer_state(self):
+        """新一节课开始时清掉上一节的答案缓存和重试状态。"""
+        with self._answer_state_lock:
+            self._answer_results.clear()
+            self._answer_running.clear()
+            self._answer_submitted.clear()
+            self._answer_submitting.clear()
+            self._answer_retry_events.clear()
+            self._reopen_answer_attempts.clear()
+        self._problem_deadlines.clear()
+        self._problem_deadline_extended.clear()
+        for task in list(self._answer_tasks):
+            if not task.done():
+                task.cancel()
+        self._answer_tasks.clear()
+        self._answer_cancelled=False
+
+    def _current_deadline(self,problem_id):
+        return self._problem_deadlines.get(str(problem_id))
+
+    def _schedule_answer(self,problem_id):
+        """在事件循环里排一次立即作答，不阻塞 websocket 收消息。"""
+        pid=str(problem_id)
+        if self._answer_cancelled:
+            return
+        task=asyncio.ensure_future(self.answer_immediately(pid))
+        self._answer_tasks.add(task)
+        task.add_done_callback(self._answer_tasks.discard)
+
+    def _schedule_cached_submit(self,problem_id):
+        """把“重发缓存答案”丢进线程池，避免阻塞事件循环。"""
+        pid=str(problem_id)
+        if self._answer_cancelled:
+            return
+        loop=asyncio.get_event_loop()
+        task=asyncio.ensure_future(loop.run_in_executor(None,self._submit_cached,pid))
+        self._answer_tasks.add(task)
+        task.add_done_callback(self._answer_tasks.discard)
+
+    def _handle_unlockproblem(self,problem):
+        """收到题目：新题开始作答；重复下发的题优先复用缓存答案。"""
+        if not isinstance(problem,dict) or not problem.get("prob"):
+            return
+        pid=str(problem["prob"])
+        self.problemid=pid
+        now=time.time()
+        deadline=self._compute_answer_deadline(problem,now)
+        if deadline is None:
+            stored=self.problems.get(pid) or {}
+            deadline=self._compute_answer_deadline(stored,now)
+        old=self._problem_deadlines.get(pid)
+        # 重复下发/重新开放时不要把已经算好的、更晚的死线改短
+        if old is not None and (deadline is None or deadline<old):
+            deadline=old
+        else:
+            # 这次是按题目新下发的 limit 重新算的，里面又带了 +30 缓冲
+            self._problem_deadline_extended.discard(pid)
+        self._problem_deadlines[pid]=deadline
+        if deadline is not None:
+            print(f"[雨课堂] 题目 {pid} 作答时间还剩 "
+                  f"{max(int(deadline-now),0)} 秒")
+        if self._answer_cancelled:
+            return
+        with self._answer_state_lock:
+            submitted=pid in self._answer_submitted
+            running=pid in self._answer_running
+            has_result=pid in self._answer_results
+            event=self._answer_retry_events.setdefault(pid,threading.Event())
+        if submitted:
+            print(f"[雨课堂] 题目 {pid} 已经提交过，忽略重复的 unlockproblem")
+            return
+        if has_result:
+            print(f"[雨课堂] 题目 {pid} 重新开放，重发已缓存的答案")
+            event.set()
+            self._schedule_cached_submit(pid)
+            return
+        if running:
+            print(f"[雨课堂] 题目 {pid} 正在作答，忽略重复的 unlockproblem")
+            return
+        self._schedule_answer(pid)
+
+    def _handle_extendtime(self,problem):
+        """老师点了“延长答题时间”：更新死线，并唤醒还没提交成功的答案。"""
+        if not isinstance(problem,dict):
+            return
+        try:
+            extend=float(problem.get("extend") or 0)
+        except (TypeError,ValueError):
+            return
+        if extend<=0:
+            return
+        pid=problem.get("prob") or problem.get("problemId") or self.problemid
+        if not pid:
+            return
+        pid=str(pid)
+        old=self._problem_deadlines.get(pid)
+        if old is None:
+            print(f"[雨课堂] 题目 {pid} 延长 {extend:g} 秒，但本题没有时限，忽略")
+            return
+        now=time.time()
+        # old 里含 +30 缓冲；第一次延长先还原服务端死线，再按“从现在/原死线
+        # 起加 extend”。已经延长过的题，old 就是服务端死线，不能再减一次。
+        if pid in self._problem_deadline_extended:
+            server_deadline=old
+        else:
+            server_deadline=old-ANSWER_DEADLINE_GRACE
+        new_deadline=max(now,server_deadline)+extend
+        self._problem_deadlines[pid]=new_deadline
+        self._problem_deadline_extended.add(pid)
+        print(f"[雨课堂] 题目 {pid} 延长答题时间 {extend:g} 秒，"
+              f"新死线还剩 {max(int(new_deadline-now),0)} 秒")
+        if self._answer_cancelled:
+            return
+        with self._answer_state_lock:
+            submitted=pid in self._answer_submitted
+            running=pid in self._answer_running
+            has_result=pid in self._answer_results
+            reopened=pid in self._reopen_answer_attempts
+            event=self._answer_retry_events.setdefault(pid,threading.Event())
+        event.set()
+        if submitted:
+            return
+        if has_result:
+            print(f"[雨课堂] 题目 {pid} 延长后立即重发缓存答案")
+            self._schedule_cached_submit(pid)
+            return
+        if running:
+            print(f"[雨课堂] 题目 {pid} 的 AI 还在作答，延长后不重复调用")
+            return
+        if reopened:
+            return
+        with self._answer_state_lock:
+            self._reopen_answer_attempts.add(pid)
+        print(f"[雨课堂] 题目 {pid} 重新开放，补跑一次 AI 作答")
+        self._schedule_answer(pid)
+
+    def _answer_detail(self,problem_id):
+        state=self._answer_results.get(str(problem_id)) or {}
+        detail=(f"题型={state.get('type_name')} 答案={state.get('result')}"
+                f"（来源={state.get('source')}）")
+        dropped=int(state.get("dropped") or 0)
+        if dropped>0:
+            detail+=f"（有 {dropped} 个答案对不上选项，已忽略）"
+        return detail
+
+    def _post_answer_once(self,problem_id):
+        """提交一次缓存答案，返回 (kind, reason, http_response)。"""
+        pid=str(problem_id)
+        state=self._answer_results.get(pid)
+        if not state:
+            return "missing","没有缓存答案",None
+        url="https://www.yuketang.cn/api/v3/lesson/problem/answer"
+        headers={
+            "referer":f"https://www.yuketang.cn/lesson/fullscreen/v3/{self.lessonId}?source=5",
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "cookie":self.cookie,
+            "Content-Type":"application/json",
+            "Authorization":self.Authorization
+        }
+        data={
+            "dt":int(time.time()*1000),
+            "problemId":pid,
+            "problemType":state.get("problem_type"),
+            "result":state.get("result"),
+        }
+        try:
+            res=requests.post(url=url,headers=headers,json=data,timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            return "request_error",f"{type(e).__name__}: {e}",None
+        self.setAuthorization(res)
+        if api_ok(res):
+            return "ok","OK",res
+        return answer_error_kind(res),api_reason(res),res
+
+    def _submit_cached(self,problem_id):
+        """提交缓存答案：题目已结束时最多重试 2 次，每次间隔 5 秒。"""
+        pid=str(problem_id)
+        with self._answer_state_lock:
+            if self._answer_cancelled or pid in self._answer_submitted:
+                return
+            if pid in self._answer_submitting:
+                return
+            self._answer_submitting.add(pid)
+            event=self._answer_retry_events.setdefault(pid,threading.Event())
+            state=self._answer_results.get(pid)
+        if not state:
+            with self._answer_state_lock:
+                self._answer_submitting.discard(pid)
+            return
+        try:
+            detail=self._answer_detail(pid)
+            for attempt in range(1,ANSWER_SUBMIT_MAX_ATTEMPTS+1):
+                if self._answer_cancelled:
+                    return
+                kind,reason,res=self._post_answer_once(pid)
+                if kind=="ok":
+                    with self._answer_state_lock:
+                        self._answer_submitted.add(pid)
+                    suffix="" if attempt==1 else f"（第 {attempt} 次提交）"
+                    self.msgmgr.sendMsg(f"答题成功{suffix}：{detail}",user=self.name)
+                    return
+                if kind=="already":
+                    with self._answer_state_lock:
+                        self._answer_submitted.add(pid)
+                    self.msgmgr.sendMsg(
+                        f"答题成功：{detail}（雨课堂提示已经作答过，不再重复提交）",
+                        user=self.name)
+                    return
+                if kind!="finished":
+                    self.msgmgr.sendMsg(f"答题失败：{reason}（{detail}）",user=self.name)
+                    return
+                if attempt>=ANSWER_SUBMIT_MAX_ATTEMPTS:
+                    self.msgmgr.sendMsg(
+                        f"答题失败：{reason}（{detail}，已提交 {attempt} 次）",
+                        user=self.name)
+                    return
+                print(f"[雨课堂] 题目 {pid} 第 {attempt} 次提交失败（{reason}），"
+                      f"{ANSWER_SUBMIT_RETRY_DELAY} 秒后重试")
+                event.wait(ANSWER_SUBMIT_RETRY_DELAY)
+                event.clear()
+                if self._answer_cancelled:
+                    return
+        finally:
+            with self._answer_state_lock:
+                self._answer_submitting.discard(pid)
+
     def answer(self,problem_id=None):
         problem_id=self.problemid if problem_id is None else problem_id
+        pid=str(problem_id)
+        with self._answer_state_lock:
+            if pid in self._answer_submitted:
+                print(f"[雨课堂] 题目 {pid} 已经提交过，跳过重复作答")
+                return
         # 用 get 而不是 []：本地没有这道题（比如课件还没同步过来）时，
         # 原来会抛 KeyError 把整个监听打断，现在记一笔明确的失败。
-        problem=self.problems.get(str(problem_id))
+        problem=self.problems.get(pid)
         if problem is None:
             # 收到题就立即作答时，课件数据可能还差一拍没同步过来；先补拉一次。
             try:
                 self.fetch_presentation()
             except Exception as e:
                 print(f"[雨课堂] 题目数据缺失，补拉课件失败：{type(e).__name__}: {e}")
-            problem=self.problems.get(str(problem_id))
+            problem=self.problems.get(pid)
         if problem is None:
-            self.msgmgr.sendMsg(f"答题失败：本地没有题目 {problem_id} 的数据（课件可能还没同步）",user=self.name)
+            self.msgmgr.sendMsg(f"答题失败：本地没有题目 {pid} 的数据（课件可能还没同步）",user=self.name)
             return
 
-        deadline=self._problem_deadlines.get(str(problem_id))
+        deadline=self._current_deadline(pid)
         if self._answer_cancelled:
-            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+            print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
             return
-        if self._answer_expired(problem_id,deadline):
-            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+        if self._answer_expired(pid,deadline):
+            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {pid}）",user=self.name)
             return
 
         problem_type=int(problem.get("problemType") or 0)
@@ -903,44 +1169,46 @@ class yuketang:
         source="雨课堂下发"
         if answers is None and self.answer_source in ("ai","auto") and self.answer_ai_enabled:
             if self._answer_cancelled:
-                print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+                print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
                 return
-            if self._answer_expired(problem_id,deadline):
+            deadline=self._current_deadline(pid)
+            if self._answer_expired(pid,deadline):
                 self.msgmgr.sendMsg(
-                    f"跳过作答：答题时间已结束，未调用大模型（题目 {problem_id}）",
+                    f"跳过作答：答题时间已结束，未调用大模型（题目 {pid}）",
                     user=self.name)
                 return
-            images=self.collect_images(problem,problem_id,deadline=deadline)
+            images=self.collect_images(problem,pid,deadline=deadline)
             if self._answer_cancelled:
-                print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
+                print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
                 return
-            if self._answer_expired(problem_id,deadline):
+            deadline=self._current_deadline(pid)
+            if self._answer_expired(pid,deadline):
                 self.msgmgr.sendMsg(
-                    f"跳过作答：答题时间已结束，未调用大模型（题目 {problem_id}）",
+                    f"跳过作答：答题时间已结束，未调用大模型（题目 {pid}）",
                     user=self.name)
                 return
             if images:
-                print(f"[雨课堂] 题目 {problem_id} 带 {len(images)} 张图片，一起交给模型识别")
+                print(f"[雨课堂] 题目 {pid} 带 {len(images)} 张图片，一起交给模型识别")
             effort=self.answer_reasoning_effort or "默认"
-            print(f"[雨课堂] 题目 {problem_id} 请求大模型（推理强度={effort}，"
+            # 已经发出的 AI 请求在死线后再多给 30 秒收尾：
+            # 老师可能刚好在这段时间延长，收到 extendtime 后会用新死线提交。
+            ai_deadline=None if deadline is None else deadline+ANSWER_INFLIGHT_GRACE
+            print(f"[雨课堂] 题目 {pid} 请求大模型（推理强度={effort}，"
                   f"超时={self.answer_timeout} 秒）")
             started=time.time()
             answers,note=ai_solve_problem(problem,self.answer_api_key,self.answer_base_url,
                                           self.answer_model,self.answer_timeout,
-                                          images=images,deadline=deadline,
+                                          images=images,deadline=ai_deadline,
                                           reasoning_effort=self.answer_reasoning_effort)
             elapsed=time.time()-started
-            print(f"[雨课堂] 题目 {problem_id} 大模型作答耗时 {elapsed:.1f} 秒")
+            print(f"[雨课堂] 题目 {pid} 大模型作答耗时 {elapsed:.1f} 秒")
             if answers is None:
                 self.answer_note=f"{note}（耗时 {elapsed:.1f} 秒）"
             else:
                 source=f"{note}，耗时 {elapsed:.1f} 秒"
 
         if self._answer_cancelled:
-            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
-            return
-        if self._answer_expired(problem_id,deadline):
-            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
+            print(f"[雨课堂] 课程已结束，跳过题目 {pid} 的作答")
             return
 
         result=normalize_result(problem,answers)
@@ -958,7 +1226,7 @@ class yuketang:
                 reason="答案解析不出有效内容"
                 extra=f"，拿到的答案为 {answers!r}"
             detail=f"题型={type_name}{extra}"
-            saved=self.dump_problem(problem,problem_id)
+            saved=self.dump_problem(problem,pid)
             if saved:
                 detail+=f"，原始数据已存 {os.path.basename(saved)}"
             self.msgmgr.sendMsg(f"跳过作答：{reason}（{detail}）",user=self.name)
@@ -976,36 +1244,27 @@ class yuketang:
         if isinstance(answers,(list,tuple)) and problem_type not in (4,5):
             dropped=len([item for item in answers if _has_content(item)])-len(result)
 
-        url="https://www.yuketang.cn/api/v3/lesson/problem/answer"
-        headers={
-            "referer":f"https://www.yuketang.cn/lesson/fullscreen/v3/{self.lessonId}?source=5",
-            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-            "cookie":self.cookie,
-            "Content-Type":"application/json",
-            "Authorization":self.Authorization
+        # 先缓存答案，再决定是否现在提交。这样即使在死线后才算出来，
+        # 后面收到 extendtime / 重新开放事件时还能直接重发，不用再问一次模型。
+        state={
+            "result":result,
+            "problem_type":problem_type,
+            "type_name":type_name,
+            "source":source,
+            "dropped":dropped,
         }
-        data={
-             "dt":int(time.time()*1000),
-             "problemId":problem_id,
-            "problemType":problem_type,
-            "result":result
-        }
-        try:
-            res=requests.post(url=url,headers=headers,json=data,timeout=REQUEST_TIMEOUT)
-        except Exception as e:
+        with self._answer_state_lock:
+            self._answer_results[pid]=state
+
+        deadline=self._current_deadline(pid)
+        if self._answer_expired(pid,deadline):
             self.msgmgr.sendMsg(
-                f"答题失败：请求出错 {type(e).__name__}: {e}（题型={type_name} 答案={result}）",
+                f"跳过作答：答题时间已结束（题目 {pid}，答案已缓存，"
+                f"若老师延长会自动重交）",
                 user=self.name)
             return
-        self.setAuthorization(res)
-        # 成败都报，并保留题型 / 答案 / 来源，方便复盘
-        detail=f"题型={type_name} 答案={result}（来源={source}）"
-        if dropped>0:
-            detail+=f"（有 {dropped} 个答案对不上选项，已忽略）"
-        if api_ok(res):
-            self.msgmgr.sendMsg(f"答题成功：{detail}",user=self.name)
-        else:
-            self.msgmgr.sendMsg(f"答题失败：{api_reason(res)}（{detail}）",user=self.name)
+
+        self._submit_cached(pid)
 
 
 
@@ -1063,7 +1322,7 @@ class yuketang:
     async def ws_lesson(self):
         uri = "wss://www.yuketang.cn/wsapp/"
         loop=asyncio.get_event_loop()
-        self._answer_cancelled=False
+        self._reset_answer_state()
         async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as websocket:
             # 发送 "hello" 消息以建立连接
             hello_message = {
@@ -1106,51 +1365,47 @@ class yuketang:
                             self.msgmgr.sendMsg(f"获取课件失败：{type(e).__name__}: {e}",user=self.name)
                         flag=0
                 elif op=="unlockproblem":
-                    problem=server_response.get('problem') or {}
-                    if problem.get('prob'):
-                        self.problemid=problem['prob']
-                        now=time.time()
-                        deadline=self._compute_answer_deadline(problem,now)
-                        if deadline is None:
-                            stored=self.problems.get(str(self.problemid)) or {}
-                            deadline=self._compute_answer_deadline(stored,now)
-                        self._problem_deadlines[str(self.problemid)]=deadline
-                        if deadline is not None:
-                            print(f"[雨课堂] 题目 {self.problemid} 作答时间还剩 "
-                                  f"{max(int(deadline-now),0)} 秒")
-                        task=asyncio.ensure_future(self.answer_immediately(self.problemid))
-                        self._answer_tasks.add(task)
-                        task.add_done_callback(self._answer_tasks.discard)
+                    self._handle_unlockproblem(server_response.get('problem') or {})
+                elif op=="extendtime":
+                    # 老师延长答题时间：参考项目里是 op=extendtime + problem.extend
+                    self._handle_extendtime(server_response.get('problem') or {})
                 elif op=="lessonfinished":
                     self.msgmgr.sendMsg("课程结束了",user=self.name)
                     self._cancel_answer_tasks()
                     self._problem_deadlines.clear()
+                    self._problem_deadline_extended.clear()
                     break
 
     async def answer_immediately(self,problem_id):
         """收到题目后立即开始作答。
 
-        原来这里会随机等 3–5 秒再调用模型；现在去掉这段等待，收到
-        unlockproblem 就马上把作答丢进线程池，尽量给模型多留时间。
+        同一道题只允许一个 AI 任务；正在跑或已经提交过的题目直接返回。
         题目带作答时限（limit）时，到点后直接跳过，不再调用大模型。
         """
-        deadline=self._problem_deadlines.get(str(problem_id))
-        if self._answer_cancelled:
-            print(f"[雨课堂] 课程已结束，跳过题目 {problem_id} 的作答")
-            return
-        if self._answer_expired(problem_id,deadline):
-            self.msgmgr.sendMsg(f"跳过作答：答题时间已结束（题目 {problem_id}）",user=self.name)
-            return
-
-        print(f"[雨课堂] 收到题目 {problem_id}，立即开始作答")
-        loop=asyncio.get_event_loop()
+        pid=str(problem_id)
+        with self._answer_state_lock:
+            if (self._answer_cancelled or pid in self._answer_submitted
+                    or pid in self._answer_running):
+                return
+            self._answer_running.add(pid)
         try:
-            await loop.run_in_executor(None,self.answer,problem_id)
+            deadline=self._current_deadline(pid)
+            if self._answer_expired(pid,deadline):
+                self.msgmgr.sendMsg(
+                    f"跳过作答：答题时间已结束（题目 {pid}）",user=self.name)
+                return
+
+            print(f"[雨课堂] 收到题目 {pid}，立即开始作答")
+            loop=asyncio.get_event_loop()
+            await loop.run_in_executor(None,self.answer,pid)
         except asyncio.CancelledError:
-            print(f"[雨课堂] 课程结束，取消题目 {problem_id} 的作答")
+            print(f"[雨课堂] 课程结束，取消题目 {pid} 的作答")
             raise
         except Exception:
             traceback.print_exc()
+        finally:
+            with self._answer_state_lock:
+                self._answer_running.discard(pid)
 
 
 def ykt_user(name):
