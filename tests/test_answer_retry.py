@@ -194,6 +194,31 @@ class EventAndDeadlineTest(unittest.TestCase):
         obj2._schedule_cached_submit.assert_called_once_with("p1")
         obj2._schedule_answer.assert_not_called()
 
+    def test_submission_gate_blocks_after_original_deadline(self):
+        obj = make_obj()
+        now = time.time()
+        # 有效死线是原截止后 30 秒：当前只在原截止后 10 秒，不应提交
+        obj._problem_deadlines["p1"] = now + 20
+        cache(obj)
+        obj._post_answer_once = mock.Mock(return_value=("ok", "OK", None))
+        obj._submit_cached("p1")
+        obj._post_answer_once.assert_not_called()
+
+        # 收到 extendtime 后，死线变成服务端新死线，可以提交
+        obj._problem_deadline_extended.add("p1")
+        obj._problem_deadlines["p1"] = time.time() + 20
+        obj._submit_cached("p1")
+        obj._post_answer_once.assert_called_once()
+        self.assertIn("p1", obj._answer_submitted)
+
+    def test_submission_gate_allows_before_original_deadline(self):
+        obj = make_obj()
+        obj._problem_deadlines["p1"] = time.time() + 60
+        cache(obj)
+        obj._post_answer_once = mock.Mock(return_value=("ok", "OK", None))
+        obj._submit_cached("p1")
+        obj._post_answer_once.assert_called_once()
+
     def test_extendtime_reopens_ai_once(self):
         obj = make_obj()
         obj._problem_deadlines["p1"] = time.time() + 25

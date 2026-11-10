@@ -37,8 +37,9 @@ IMAGE_DOWNLOAD_BUDGET = 20
 # 单张图片的总下载时长上限（秒）
 IMAGE_DOWNLOAD_TIMEOUT = 15
 # 老师在课上偶尔会临时延长答题时间，服务端下发的 limit 不一定是最新死线。
-# 在 limit 的基础上多留 30 秒再判定“答题时间已结束”，避免提前放弃；
-# 题目本身没有时限（limit=0）时不受影响。想调就改这一行。
+# 本地多留 30 秒用于“等 AI 收尾 / 等 extendtime”；注意这 30 秒不是提交窗口：
+# 没有收到老师延长时，过了原始 sendTime+limit 就不再提交，避免老师关闭题目后
+# 还继续打答案。题目本身没有时限（limit=0）时不受影响。
 ANSWER_DEADLINE_GRACE = 30
 # 已经发给大模型的请求，如果死线到了还没返回，最多再给它 30 秒收尾：
 # 老师可能刚好在这时延长答题时间。注意这只影响已经发出的请求，死线后
@@ -940,6 +941,32 @@ class yuketang:
     def _current_deadline(self,problem_id):
         return self._problem_deadlines.get(str(problem_id))
 
+    def _server_deadline(self,problem_id):
+        """服务端原始死线，不含本地多留的 30 秒缓冲。"""
+        current=self._current_deadline(problem_id)
+        if current is None:
+            return None
+        if str(problem_id) in self._problem_deadline_extended:
+            return current
+        return current-ANSWER_DEADLINE_GRACE
+
+    def _submission_allowed(self,problem_id):
+        """是否允许现在提交。
+
+        原截止时间一到就禁止提交；只有收到老师的 extendtime、死线被真正
+        推后之后才允许继续提交。+30 秒缓冲只用于等 AI/等延长，不再直接
+        当成提交窗口，避免老师关闭题目后还往服务端打答案。
+        """
+        current=self._current_deadline(problem_id)
+        if current is None:
+            return True
+        now=time.time()
+        if now>=current:
+            return False
+        if str(problem_id) in self._problem_deadline_extended:
+            return True
+        return now<current-ANSWER_DEADLINE_GRACE
+
     def _schedule_answer(self,problem_id):
         """在事件循环里排一次立即作答，不阻塞 websocket 收消息。"""
         pid=str(problem_id)
@@ -1110,9 +1137,16 @@ class yuketang:
                 self._answer_submitting.discard(pid)
             return
         try:
+            if not self._submission_allowed(pid):
+                print(f"[雨课堂] 题目 {pid} 原答题时间已结束，"
+                      f"先不提交，等老师延长")
+                return
             detail=self._answer_detail(pid)
             for attempt in range(1,ANSWER_SUBMIT_MAX_ATTEMPTS+1):
                 if self._answer_cancelled:
+                    return
+                if not self._submission_allowed(pid):
+                    print(f"[雨课堂] 题目 {pid} 已过原答题时间，停止重试提交")
                     return
                 kind,reason,res=self._post_answer_once(pid)
                 if kind=="ok":
@@ -1383,6 +1417,12 @@ class yuketang:
             self.msgmgr.sendMsg(
                 f"跳过作答：答题时间已结束（题目 {pid}，答案已缓存，"
                 f"若老师延长会自动重交）",
+                user=self.name)
+            return
+        if not self._submission_allowed(pid):
+            self.msgmgr.sendMsg(
+                f"跳过作答：原答题时间已结束，尚未收到老师延长（题目 {pid}，"
+                f"答案已缓存，若老师延长会自动重交）",
                 user=self.name)
             return
 

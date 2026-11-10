@@ -143,6 +143,7 @@ class ShareAnswerFlowTest(unittest.TestCase):
         obj.answer_model = "deepseek-flash"
         obj.answer_reasoning_effort = "high"
         obj._problem_deadlines = {"p1": time.time() + 5}
+        obj._problem_deadline_extended = set()
         return obj
 
     def test_answer_two_accounts_one_ai_call(self):
