@@ -88,6 +88,8 @@ API Key 有三种写法，任选其一：填 `answer.api_key`、放进 `DEEPSEEK
 | `23` | APP 点击课堂 |
 | `91` | 旁听（观摩） |
 
+签到请求仍按 web 端方式发送（Chrome UA + referer），请求体带 `joinIfNotIn: true`（与 course_helper 一致）。注意不能照搬它的安卓 App 请求头（`x-client: app` 等）：服务端对 App 客户端另有设备鉴权，web cookie 会被拒 `UNAUTHENTICATED`（已实测）。其余接口（课件、答题、websocket）不受影响。
+
 想换成别的入口改这个数字即可，程序启动时会打印当前用的值。如果记录出来的方式和预期不符，用手机扫一次老师屏幕上的课堂二维码，在微信里点「···」→ 复制链接，链接里 `source=` 后面的数字就是抄二维码入口要用的值。
 
 ## 企业微信推送（可选）

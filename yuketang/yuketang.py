@@ -676,7 +676,9 @@ class yuketang:
         """
         url="https://www.yuketang.cn/api/v3/lesson/checkin"
         headers={
-            # 官方前端会把 source 一路带进 referer 和请求体，这里保持一致
+            # 官方前端会把 source 一路带进 referer 和请求体，这里保持一致。
+            # 注意：不能换成 course_helper 的安卓 App 头（x-client: app 等），
+            # 服务端对 App 客户端另有设备鉴权，web cookie 会被拒 UNAUTHENTICATED。
             "referer":f"https://www.yuketang.cn/lesson/fullscreen/v3/{self.lessonId}?source={self.checkin_source}",
             "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
             "Content-Type":"application/json; charset=utf-8",
@@ -684,7 +686,8 @@ class yuketang:
         }
         data={
             "source":self.checkin_source,
-            "lessonId":self.lessonId
+            "lessonId":self.lessonId,
+            "joinIfNotIn":True
         }
         res=requests.post(url=url,headers=headers,json=data,timeout=REQUEST_TIMEOUT)
         self.setAuthorization(res)
@@ -692,6 +695,12 @@ class yuketang:
         # 而界面上只留下"已发起签到"一句，看不出到底签到成没成。现在明确报一句。
         if not api_ok(res):
             reason=api_reason(res)
+            try:
+                code=res.json().get("code")
+            except Exception:
+                code=None
+            if code == 50070:
+                reason="老师已开启动态码签到"
             if notify_failure:
                 self.msgmgr.sendMsg(f"签到失败：{reason}",user=self.name)
             raise RuntimeError(f"签到失败：{reason}")
