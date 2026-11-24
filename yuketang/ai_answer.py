@@ -166,49 +166,65 @@ def extract_image_urls(problem):
 
 
 def build_messages(problem, images=None):
-    """拼出给大模型的提示词；images 是已经准备好的图片 data URL 列表"""
+    """拼出给大模型的提示词；images 是已经准备好的图片 data URL 列表
+
+    规则放在选项之后（提示词末尾的约束更容易被遵守），每种题型都给出
+    具体的输出示例，避免模型把“选项标识”写成选项文字或带装饰的写法。
+    """
     problem_type = int(problem.get("problemType") or 0)
     type_name = PROBLEM_TYPE_NAMES.get(problem_type, "其它题型")
 
     lines = [f"题型：{type_name}", f"题干：{plain_text(problem.get('body'))}"]
     options = option_items(problem)
+    keys_text = "、".join(str(key) for key, _ in options)
     if options:
         lines.append("选项：")
         for key, text in options:
-            lines.append(f"  {key}: {text}")
+            lines.append(f"  {key}: {text or '（内容见图片）'}")
 
-    if problem_type == 4:
+    need_pick = '不确定时选最可能的，不要留空、不要回答"不知道"。'
+
+    if problem_type == 5:            # 主观题
+        lines += ["作答要求：直接写出简短、正确的答案。",
+                  need_pick,
+                  '输出格式：{"answers": ["你的答案"]}']
+    elif problem_type == 4:          # 填空题：每个空一个字符串，按空序排列
         count = blank_count(problem)
-        lines += [f"这是一道填空题，一共 {count} 个空。",
-                  f'只输出 JSON，answers 里按空序放 {count} 个答案文本：{{"answers": ["第一空", "第二空"]}}',
-                  "要求：",
-                  "1. answers 的个数必须等于空的个数，按空序排列；",
-                  "2. 答案是文本本身，不要写“第1空”这类提示，不要带序号、括号或句号。"]
-    elif problem_type == 5:
-        lines += ["这是一道主观题，答案写简短、直接。",
-                  '只输出 JSON：{"answers": ["你的答案"]}']
-    elif options:
-        keys_text = "、".join(str(key) for key, _ in options)
-        lines += [f"选项标识只有这些：{keys_text}",
-                  '只输出 JSON：{"answers": ["选项标识"]}',
-                  "要求：",
-                  f"1. answers 里只能放上面列出的标识本身（{keys_text}），其它值一律不行；",
-                  '2. 不要带选项原文、序号、括号、句号或说明，不要写成 "B."、"（B）"、'
-                  '"答案：B"、"B 共模信号" 这类形式；']
-        if problem_type in (2, 3):
-            lines += ['3. 多选的正确项要全部列出，每项单独一个字符串，'
-                      '例如 {"answers": ["B", "C"]}，不要写成 "BC"；',
-                      "4. 不确定也要选，不要留空、不要回答“不知道”。"]
+        lines.append(f"作答要求：题干里的空按从左到右的顺序作答，共 {count} 个空；"
+                     f"answers 的个数必须等于 {count}。")
+        if options:
+            lines += [f"本题给出了选项（{keys_text}）：",
+                      "- 每个空与选项一一对应时，answers 里只放选项标识，"
+                      '例如 {"answers": ["A", "C", "B"]}；',
+                      "- 只有题目明确要求填文字/数字/公式时，才放内容本身，"
+                      '例如 {"answers": ["增大", "5"]}。',
+                      "选项标识按题目给出的写法（可能是字母、编号或 T/F 等），不要写选项原文。"]
         else:
-            lines += ['3. 只放一个标识，例如 {"answers": ["B"]}；',
-                      "4. 不确定也要选一个最可能的，不要留空、不要回答“不知道”。"]
+            lines += ["answers 里放每个空的内容本身（文字/数字/公式），"
+                      '例如 {"answers": ["增大", "5"]}；不要写“第1空”这类提示，'
+                      "不要带序号、括号或句号。"]
+        lines.append(need_pick)
+    elif options:
+        if problem_type in (2, 3):   # 多选 / 投票
+            lines += [f"作答要求：选出所有正确选项，只写选项标识（{keys_text}）。",
+                      '输出格式：{"answers": ["A", "C"]}',
+                      "要求：每个标识单独一个字符串，不要连写成一个（不要写 \"AC\"）；"
+                      "answers 里只能是标识本身，不要写选项原文。",
+                      "多选少选都算错，正确项要全部列出。" + need_pick]
+        else:                        # 单选 / 判断
+            lines += [f"作答要求：从选项标识（{keys_text}）里选出一个最可能的正确答案。",
+                      '输出格式：{"answers": ["B"]}',
+                      "要求：只写标识本身，不要带括号、句号、引号、“答案：”，也不要写选项原文。",
+                      need_pick]
     else:
-        lines += ['只输出 JSON：{"answers": ["你的答案"]}',
-                  "不确定也要给出一个最可能的答案，不要留空。"]
+        lines += ["作答要求：直接写出你最可能的答案。",
+                  need_pick,
+                  '输出格式：{"answers": ["你的答案"]}']
 
-    system = ("你是一个正在上课的学生，需要作答雨课堂课内题。"
-              "任何情况下都只输出一个 JSON 对象：不要解释、不要复述题目、"
-              "不要用 Markdown 代码块，也不要在 JSON 前后加任何文字或标点。")
+    system = ("你是一名正在上课的成绩优秀的大学生，正在作答老师下发的课内题。"
+              "严格按用户消息给出的输出格式作答："
+              "任何情况下都只输出一个 JSON 对象，不要解释、不要复述题目、"
+              "不要输出推理过程、不要用 Markdown 代码块，JSON 前后不加任何文字。")
     text = "\n".join(lines)
 
     if images:
