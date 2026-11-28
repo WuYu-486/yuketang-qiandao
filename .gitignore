@@ -19,3 +19,7 @@ debug_lessons_*.json
 dashscope_key.txt
 # 跨账号共享 AI 答案的本地缓存（含题目/答案，不要提交）
 answer_cache.sqlite3*
+# 部署相关私密文件
+notify.ini
+cacert.pem
+deploy/local/*.local

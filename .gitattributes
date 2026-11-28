@@ -1,0 +1,8 @@
+# 部署脚本强制 LF，避免 Windows 提交后在服务器上出现 bash: $'\r': command not found
+*.sh text eol=lf
+deploy/server/files/systemd/*.service text eol=lf
+deploy/server/files/systemd/*.timer text eol=lf
+deploy/server/files/journald-50-ykt.conf text eol=lf
+deploy/server/files/sudoers-ykt-deploy text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
