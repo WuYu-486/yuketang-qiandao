@@ -1,25 +1,32 @@
+# ===== Python / 虚拟环境 =====
 __pycache__/
 *.pyc
 .venv/
 
-# 本地登录态与运行产物（含隐私，不要提交）
+# ===== 本地登录态与账号配置（含隐私，勿提交） =====
 config.json
+accounts.json
 cookie_*
 qrcode_*.jpg
 .qrcode_*.tmp
 ACCESS_TOKEN.txt
-accounts.json
-history_*.log
-log_*.log
-gui_error.log
-# 题目原始数据（排查答题问题时自动落盘）
+dashscope_key.txt
+
+# ===== 运行日志与调试产物 =====
+*.log
 debug_problem_*.json
 debug_lessons_*.json
-# 可选：AI 作答用的 API Key
-dashscope_key.txt
-# 跨账号共享 AI 答案的本地缓存（含题目/答案，不要提交）
 answer_cache.sqlite3*
-# 部署相关私密文件
+
+# ===== 一次性临时脚本 / 排查文件 =====
+temp/
+
+# ===== 服务器部署相关（仅本地维护，不随仓库分发） =====
+deploy/
+scripts/server-log.bat
+scripts/server-refresh.bat
+docs/邮件推送格式.md
+
+# ===== 部署私密文件（若将来纳入仓库也必须排除） =====
 notify.ini
 cacert.pem
-deploy/local/*.local

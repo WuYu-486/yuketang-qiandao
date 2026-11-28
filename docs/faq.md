@@ -7,8 +7,8 @@
 | 二维码扫不了 / 提示过期 | 一张码约 2 分钟失效，点「刷新登录二维码」换新；程序也会自动换新 |
 | 签到失败会一直重试吗 | 会。首次失败后 10 秒重试，每失败 6 次间隔加 30 秒，最长 310 秒，次数不限；签到成功、课程结束或停止监听后重置为 10 秒 |
 | 界面报「没找到 .venv」 | 还没装依赖，按 README 的「快速开始」建好虚拟环境 |
-| 双击 gui.bat 没反应 | 手动跑 `.venv\Scripts\python.exe gui.py` 看报错；启动失败时根目录会留下 `gui_error.log` |
-| 双击 gui.bat 弹「无法验证发布者」 | Windows 对批处理的安全提示，改双击 `gui.pyw`，或在终端里运行 `gui.bat` |
+| 双击 scripts\gui.bat 没反应 | 手动跑 `.venv\Scripts\python.exe gui.py` 看报错；启动失败时根目录会留下 `gui_error.log` |
+| 双击 scripts\gui.bat 弹「无法验证发布者」 | Windows 对批处理的安全提示，改双击 `gui.pyw`，或在终端里运行 `scripts\gui.bat` |
 | 窗口只有文字没有二维码 | 没装 pillow：`.venv\Scripts\python.exe -m pip install pillow` |
 | 能帮别人挂账号吗 | 可以。每个账号单独添加、各自扫码、各自「开始监听」；别关窗口 |
 

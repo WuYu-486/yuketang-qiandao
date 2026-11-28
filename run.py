@@ -10,7 +10,7 @@
     python run.py status              # 查看登录状态、当前有没有课
     python run.py ykt --name 张三      # 多账号：每个 name 各存一份 cookie
 
-图形界面见 gui.py（双击 gui.bat），界面上的按钮最终调用的就是这里的命令。
+图形界面见 gui.py（双击 scripts\gui.bat），界面上的按钮最终调用的就是这里的命令。
 """
 
 import argparse
