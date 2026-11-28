@@ -32,6 +32,7 @@ py -3 -m venv .venv
 | [自动答题机制](docs/auto-answer.md) | 答案生成、时限与重试、跨账号共享 |
 | [配置说明](CONFIG.md) | `config.json` 全部字段：大模型、签到方式、企业微信推送等 |
 | [常见问题](docs/faq.md) | 二维码 / 启动 / 签到问题排查、已知限制 |
+| [服务器部署](deploy/README.md) | 华为云 ECS 常驻运行：systemd 定时、邮件日报/告警、登录刷新、日常同步 |
 
 ## 隐私说明
 
